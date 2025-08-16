@@ -1,0 +1,7 @@
+boto3
+streamlit
+networkx
+openai
+graphviz
+matplotlib
+pyvis
