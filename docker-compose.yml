@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  iam-xray:
+    build: .
+    container_name: iam-xray
+    ports:
+      - "8501:8501"
+    environment:
+      - IAM_XRAY_FERNET_KEY=${IAM_XRAY_FERNET_KEY}
+    volumes:
+      - ./data:/app/data
+    user: "${UID:-1000}:${GID:-1000}"

@@ -1,4 +1,37 @@
-venv
-lib
-data
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+*.log
+
+# --- Virtual environments ---
+venv/
+.env/
+.venv/
+
+# --- Streamlit cache ---
+.streamlit/
+
+# --- Local data & secrets ---
+data/
+*.db
+*.sqlite
+auth.json
+setup.lock
+
+# --- Config / Secrets ---
+.env
 config.py
+
+# --- Docker ---
+*.pid
+*.sock
+*.log
+*.tmp
+
+# --- OS crap ---
+.DS_Store
+Thumbs.db

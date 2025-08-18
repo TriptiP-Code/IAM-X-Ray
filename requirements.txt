@@ -1,7 +1,7 @@
 boto3
-streamlit
+streamlit==1.36.0
 networkx
-openai
 graphviz
 matplotlib
 pyvis
+cryptography
