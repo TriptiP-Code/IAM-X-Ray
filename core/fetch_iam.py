@@ -2828,7 +2828,7 @@
 #         print("Impact Score:", s.get("_meta", {}).get("diff", {}).get("impact_score"))
 
 
-
+# core/fetch_iam.py
 import boto3
 import json
 import os
@@ -2841,17 +2841,18 @@ import time
 import random
 import concurrent.futures
 import argparse
-import smtplib
-import streamlit as st
 from email.mime.text import MIMEText
+import smtplib
+import functools
+from botocore.config import Config
+from botocore.session import Session as BotocoreSession
 from core import secure_store
 from core.cleanup import purge_old_snapshots
-import functools
+from core import config  # For DEFAULT_REGIONS, AWS_REGION, EMAIL_ALERT_THRESHOLD, KEEP_DAYS
 
 logger = logging.getLogger("fetch_iam")
 logger.setLevel(logging.INFO)
 
-# if no handlers, add a basic one (prevents "No handler" in some environments)
 if not logger.handlers:
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
@@ -2859,14 +2860,20 @@ if not logger.handlers:
 
 SENSITIVE_ACTIONS = {"iam:passrole", "sts:assumerole"}
 WILDCARD_ACTION = "*"
-DEFAULT_SNAPSHOT = "data/iam_snapshot.json"
-VERSIONED_DIR = "data/snapshots"  # will also store timestamped copies
 
-# Cache boto3 session
+# Cache boto3 session with retry config
 @functools.lru_cache()
 def get_boto3_session(profile_name=None):
+    retry_config = Config(
+        retries={"max_attempts": 3, "mode": "standard"},
+        region_name=config.AWS_REGION
+    )
+    botocore_session = BotocoreSession()
+    botocore_session.set_config_variable('retries', {'max_attempts': 3, 'mode': 'standard'})
+
     session_args = {"profile_name": profile_name} if profile_name else {}
-    return boto3.Session(**session_args) if session_args else boto3.Session()
+    session = boto3.Session(botocore_session=botocore_session, **session_args) if session_args else boto3.Session(botocore_session=botocore_session)
+    return session
 
 # ---------- Utility ----------
 def _normalize_action(a):
@@ -2902,6 +2909,7 @@ def _read_snapshot(path):
         logger.warning(f"Failed to read snapshot {path}: {e}")
         return None
 
+
 # ---------- Principal parsing ----------
 def _parse_principal_value(val):
     if isinstance(val, str):
@@ -2916,6 +2924,7 @@ def _parse_principal_value(val):
         else:
             return {"type": "unknown", "value": val}
     return {"type": "unknown", "value": val}
+
 
 # ---------- Diff helpers ----------
 def _index_by(items, key):
@@ -2963,6 +2972,7 @@ def _apply_change_flags(snapshot, diff):
             if x:
                 x["_changed"] = "modified"
 
+
 # ---------- Extended static analyzer ----------
 FINDING = lambda code, sev, msg, hint=None, path=None: {
     "code": code, "severity": sev, "message": msg, "hint": hint, "path": path
@@ -2970,7 +2980,6 @@ FINDING = lambda code, sev, msg, hint=None, path=None: {
 
 
 def _svc(action):
-    """Return 'service' of 'service:Action' or '*'."""
     if not isinstance(action, str):
         return ""
     if action == "*":
@@ -2998,59 +3007,50 @@ def _analyze_policy_document_extended(doc):
         resources = _ensure_list(stmt.get("Resource")) or []
         cond = stmt.get("Condition") or {}
 
-        # A1: Wildcard in Action/NotAction
         if "*" in actions or any(isinstance(a, str) and "*" in a for a in actions):
             findings.append(FINDING("ACTION_WILDCARD", "high",
-                                   "Action uses '*' or wildcard pattern", "List explicit actions instead of '*'", path))
+                                    "Action uses '*' or wildcard pattern", "List explicit actions instead of '*'", path))
         if not_actions:
             findings.append(FINDING("NOTACTION_USED", "medium",
-                                   "NotAction is used (hard to reason least-privilege)", "Prefer explicit 'Action' allow list", path))
+                                    "NotAction is used (hard to reason least-privilege)", "Prefer explicit 'Action' allow list", path))
 
-        # A2: Sensitive actions without guard
         alow = [a.lower() for a in actions if isinstance(a, str)]
         if any(a in alow for a in ["iam:passrole", "sts:assumerole"]):
             if "*" in resources or any(r == "*" for r in resources):
                 findings.append(FINDING("SENSITIVE_NO_RESOURCE_SCOPE", "high",
-                                       "Sensitive action with Resource '*'", "Limit to specific ARNs and require conditions", path))
+                                        "Sensitive action with Resource '*'", "Limit to specific ARNs and require conditions", path))
             if not cond:
                 findings.append(FINDING("SENSITIVE_NO_CONDITION", "medium",
-                                       "Sensitive action without condition", "Add conditions like aws:ResourceTag, aws:PrincipalArn, ExternalId", path))
+                                        "Sensitive action without condition", "Add conditions like aws:ResourceTag, aws:PrincipalArn, ExternalId", path))
 
-        # R1: Resource wildcard with Allow
         if effect == "allow":
             if "*" in resources or any(isinstance(r, str) and r.strip() == "*" for r in resources):
                 findings.append(FINDING("RESOURCE_WILDCARD", "high",
-                                       "Resource is '*' with Allow", "Scope resources to specific ARNs or tags", path))
+                                        "Resource is '*' with Allow", "Scope resources to specific ARNs or tags", path))
 
-        # KMS: Decrypt without constraints
         if any(_svc(a) == "kms" and a.lower().endswith(":decrypt") for a in alow):
             if "*" in resources or not cond:
                 findings.append(FINDING("KMS_DECRYPT_PERMISSIVE", "high",
-                                       "kms:Decrypt broadly allowed", "Constrain by kms:EncryptionContext conditions and specific key ARNs", path))
+                                        "kms:Decrypt broadly allowed", "Constrain by kms:EncryptionContext conditions and specific key ARNs", path))
 
-        # S3 broad
         if any(_svc(a) == "s3" for a in alow):
             if "*" in resources:
                 findings.append(FINDING("S3_BROAD", "medium",
-                                       "S3 access with Resource '*'", "Scope to bucket and object ARNs; add aws:userid or IP conditions", path))
+                                        "S3 access with Resource '*'", "Scope to bucket and object ARNs; add aws:userid or IP conditions", path))
 
-        # New: Check for MFA and Conditions
         if not stmt.get("Condition", {}).get("Bool", {}).get("aws:MultiFactorAuthPresent"):
             findings.append(FINDING("NO_MFA", "medium",
-                                   "No MFA required", "Add aws:MultiFactorAuthPresent condition", path))
+                                    "No MFA required", "Add aws:MultiFactorAuthPresent condition", path))
         if not stmt.get("Condition"):
             findings.append(FINDING("NO_CONDITION", "medium",
-                                   "No conditions specified", "Add conditions like aws:SourceIp or aws:PrincipalArn", path))
+                                    "No conditions specified", "Add conditions like aws:SourceIp or aws:PrincipalArn", path))
 
-        # Collect risky actions set (structural)
         for a in actions or []:
             if _action_is_risky(a):
                 risky_actions.add(a)
-        # Wildcard resource marker:
         if any(isinstance(r, str) and r.strip() == "*" for r in resources):
             risky_actions.add("Resource:*")
 
-    # Score: weighted
     score = 0
     for f in findings:
         score += {"low": 1, "medium": 2, "high": 4}.get(f["severity"], 1)
@@ -3083,22 +3083,20 @@ def _analyze_trust_policy(assume_doc):
 
         if principal == "*" or (isinstance(principal, dict) and any(v == "*" for v in principal.values())):
             findings.append(FINDING("TRUST_WILDCARD_PRINCIPAL", "high",
-                                   "Trust policy allows '*' principal", "Restrict to specific AWS account/roles or services; consider aws:PrincipalOrgID", path))
+                                    "Trust policy allows '*' principal", "Restrict to specific AWS account/roles or services; consider aws:PrincipalOrgID", path))
 
-        # Service principals
         if isinstance(principal, dict):
             for k in ["Service", "AWS", "Federated"]:
                 vals = _ensure_list(principal.get(k))
                 if any(v == "*" for v in vals):
                     findings.append(FINDING("TRUST_WILDCARD_COMPONENT", "high",
-                                           f"Trust principal '{k}' uses '*'", "Pin to exact principal", path))
+                                            f"Trust principal '{k}' uses '*'", "Pin to exact principal", path))
 
         cond = s.get("Condition") or {}
-        # If AWS account principal used, suggest ExternalId/Org constraint
         if isinstance(principal, dict) and ("AWS" in principal):
             if not cond:
                 findings.append(FINDING("TRUST_NO_CONDITION", "medium",
-                                       "Account principal without conditions", "Add external ID or aws:PrincipalOrgID / SourceAccount", path))
+                                        "Account principal without conditions", "Add external ID or aws:PrincipalOrgID / SourceAccount", path))
 
         risky_actions.add("Trust:*")
 
@@ -3113,7 +3111,8 @@ def _analyze_trust_policy(assume_doc):
         "findings": findings
     }
 
-# ---------- Access Advisor integration (unchanged) ----------
+
+# ---------- Access Advisor integration ----------
 def _resolve_identifier_to_arn(iam_client, entity_type, identifier, account_id=None):
     if not identifier:
         return None
@@ -3266,10 +3265,9 @@ def fetch_service_last_used(iam_client, entity_type, identifier, account_id=None
 
     return {"services": [], "last_refreshed": None, "status": "timeout", "error": f"Timed out after {max_wait}s"}
 
-# ---------- Add usage-based findings (unchanged) ----------
-def _add_usage_based_findings(snapshot):
-    from datetime import timedelta
 
+# ---------- Add usage-based findings ----------
+def _add_usage_based_findings(snapshot):
     for entity_type, entities in [("users", snapshot["users"]), ("groups", snapshot["groups"]), ("roles", snapshot["roles"]), ("policies", snapshot["policies"])]:
         for entity in entities:
             slu = entity.get("ServiceLastUsed", {})
@@ -3318,7 +3316,8 @@ def _add_usage_based_findings(snapshot):
                 for ua in unused:
                     findings_list.append(FINDING("UNUSED_ACTION", "medium", f"Remove unused action: {ua}", "Based on Access Advisor data (unused in last 90 days)"))
 
-# ---------- Risk propagation (unchanged) ----------
+
+# ---------- Risk propagation ----------
 def _propagate_risk(snapshot):
     risky_policies = {p["PolicyName"] for p in snapshot["policies"] if p.get("IsRisky")}
     risky_roles = {r["RoleName"] for r in snapshot["roles"] if r.get("AssumePolicyRisk")}
@@ -3327,6 +3326,7 @@ def _propagate_risk(snapshot):
         for ap in role.get("AttachedPolicies", []) or []:
             if ap.get("PolicyName") in risky_policies:
                 role["AssumePolicyRisk"] = True
+                role["AssumePolicyRiskScore"] = max(role.get("AssumePolicyRiskScore", 0), 5)
                 risky_roles.add(role["RoleName"])
 
     for user in snapshot["users"]:
@@ -3336,8 +3336,10 @@ def _propagate_risk(snapshot):
                 user_risky = True
         if user_risky:
             user["IsRisky"] = True
+            user["RiskScore"] = max(user.get("RiskScore", 0), 3)
 
-# Retry decorator (unchanged)
+
+# Retry decorator
 def retry_api_call(max_retries=3, backoff_factor=1):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -3358,20 +3360,17 @@ def retry_api_call(max_retries=3, backoff_factor=1):
         return wrapper
     return decorator
 
-# Parallel fetch functions (updated with pagination)
+
+# Parallel fetch functions with progress
 @retry_api_call()
-def fetch_users(iam, account_id, fast_mode):
+def fetch_users(iam, account_id, fast_mode, progress_callback=None):
     users = []
     paginator = iam.get_paginator("list_users")
-    for page in paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': 100}):
+    batch_size = 100
+    for i, page in enumerate(paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': batch_size})):
         for u in page.get("Users", []):
             user_arn = u.get("Arn")
-            slu = {}
-            try:
-                slu = fetch_service_last_used(iam, "user", user_arn or u.get("UserName"), account_id=account_id, max_wait=60)
-            except Exception as e:
-                logger.debug(f"ServiceLastUsed error for user {u.get('UserName')}: {e}")
-                slu = {"services": [], "last_refreshed": None, "status": "failed", "error": str(e)}
+            slu = fetch_service_last_used(iam, "user", user_arn or u.get("UserName"), account_id=account_id)
             entry = {
                 "UserName": u.get("UserName"),
                 "Arn": user_arn,
@@ -3396,26 +3395,24 @@ def fetch_users(iam, account_id, fast_mode):
                     entry.setdefault("AttachedPolicies", [])
                     entry.setdefault("InlinePolicies", [])
             users.append(entry)
+        if progress_callback:
+            progress_callback((i + 1) / (1000 // batch_size))
     return users
 
 
 @retry_api_call()
-def fetch_groups(iam, account_id, fast_mode):
+def fetch_groups(iam, account_id, fast_mode, progress_callback=None):
     groups = []
     paginator = iam.get_paginator("list_groups")
-    for page in paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': 100}):
+    batch_size = 100
+    for i, page in enumerate(paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': batch_size})):
         for g in page.get("Groups", []):
             gname = g.get("GroupName")
             g_arn = g.get("Arn") or None
-            slu = {}
-            try:
-                slu = fetch_service_last_used(iam, "group", g_arn or gname, account_id=account_id, max_wait=60)
-            except Exception as e:
-                logger.debug(f"ServiceLastUsed error for group {gname}: {e}")
-                slu = {"services": [], "last_refreshed": None, "status": "failed", "error": str(e)}
-
+            slu = fetch_service_last_used(iam, "group", g_arn or gname, account_id=account_id)
             entry = {
                 "GroupName": gname,
+                "Arn": g_arn,
                 "ServiceLastUsed": slu
             }
             if not fast_mode:
@@ -3423,17 +3420,21 @@ def fetch_groups(iam, account_id, fast_mode):
                     entry["AttachedPolicies"] = iam.list_attached_group_policies(GroupName=gname).get("AttachedPolicies", [])
                     entry["InlinePolicies"] = iam.list_group_policies(GroupName=gname).get("PolicyNames", [])
                 except Exception as e:
-                    entry["AttachedPolicies"] = []
-                    entry["InlinePolicies"] = []
+                    logger.error(f"group {gname} policy fetch failed: {e}")
+                    entry.setdefault("AttachedPolicies", [])
+                    entry.setdefault("InlinePolicies", [])
             groups.append(entry)
+        if progress_callback:
+            progress_callback((i + 1) / (1000 // batch_size))
     return groups
 
 
 @retry_api_call()
-def fetch_roles(iam, account_id, fast_mode):
+def fetch_roles(iam, account_id, fast_mode, progress_callback=None):
     roles = []
     paginator = iam.get_paginator("list_roles")
-    for page in paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': 100}):
+    batch_size = 100
+    for i, page in enumerate(paginator.paginate(PaginationConfig={'MaxItems': 1000, 'PageSize': batch_size})):
         for r in page.get("Roles", []):
             rname = r.get("RoleName")
             assume_raw = r.get("AssumeRolePolicyDocument")
@@ -3445,6 +3446,7 @@ def fetch_roles(iam, account_id, fast_mode):
                 elif isinstance(assume_raw, dict):
                     assume = assume_raw
             except Exception as e:
+                logger.error(f"Role {rname} assume policy parse failed: {e}")
                 assume = {}
 
             principals_info = []
@@ -3469,15 +3471,12 @@ def fetch_roles(iam, account_id, fast_mode):
                     inline = iam.list_role_policies(RoleName=rname).get("PolicyNames", [])
                 except Exception as e:
                     logger.error(f"role {rname} policy fetch failed: {e}")
+                    attached = []
+                    inline = []
 
             trust_eval = _analyze_trust_policy(assume or {})
 
-            slu = {}
-            try:
-                slu = fetch_service_last_used(iam, "role", r.get("Arn") or rname, account_id=account_id, max_wait=60)
-            except Exception as e:
-                logger.debug(f"ServiceLastUsed error for role {rname}: {e}")
-                slu = {"services": [], "last_refreshed": None, "status": "failed", "error": str(e)}
+            slu = fetch_service_last_used(iam, "role", r.get("Arn") or rname, account_id=account_id)
 
             roles.append({
                 "RoleName": rname,
@@ -3492,43 +3491,44 @@ def fetch_roles(iam, account_id, fast_mode):
                 "InlinePolicies": inline,
                 "ServiceLastUsed": slu
             })
+        if progress_callback:
+            progress_callback((i + 1) / (1000 // batch_size))
     return roles
 
 
 @retry_api_call()
-def fetch_policies(iam, account_id, fast_mode, snapshot):
+def fetch_policies(iam, account_id, fast_mode, snapshot, progress_callback=None):
     policies = []
-    scope = "Local"
+    scope = "Local"  # Customer-managed only
     paginator = iam.get_paginator("list_policies")
-    for page in paginator.paginate(Scope=scope, PaginationConfig={'MaxItems': 1000, 'PageSize': 100}):
+    batch_size = 100
+    for i, page in enumerate(paginator.paginate(Scope=scope, PaginationConfig={'MaxItems': 1000, 'PageSize': batch_size})):
         for p in page.get("Policies", []):
             p_arn = p.get("Arn")
             p_name = p.get("PolicyName")
             entry = {"PolicyName": p_name, "Arn": p_arn, "Document": {},
                      "IsRisky": False, "RiskActions": [], "RiskScore": 0, "Findings": []}
-            try:
-                meta = iam.get_policy(PolicyArn=p_arn).get("Policy", {})
-                ver = meta.get("DefaultVersionId")
-                if ver:
-                    doc = iam.get_policy_version(PolicyArn=p_arn, VersionId=ver).get("PolicyVersion", {}).get("Document", {})
-                    entry["Document"] = doc
-                    ext = _analyze_policy_document_extended(doc or {})
-                    entry["IsRisky"] = ext["is_risky"]
-                    entry["RiskActions"] = ext["risky_actions"]
-                    entry["RiskScore"] = ext["score"]
-                    entry["Findings"] = ext["findings"]
-            except Exception as e:
-                logger.error(f"policy {p_name} doc fetch failed: {e}")
+            if not fast_mode:
+                try:
+                    meta = iam.get_policy(PolicyArn=p_arn).get("Policy", {})
+                    ver = meta.get("DefaultVersionId")
+                    if ver:
+                        doc = iam.get_policy_version(PolicyArn=p_arn, VersionId=ver).get("PolicyVersion", {}).get("Document", {})
+                        entry["Document"] = doc
+                        ext = _analyze_policy_document_extended(doc or {})
+                        entry["IsRisky"] = ext["is_risky"]
+                        entry["RiskActions"] = ext["risky_actions"]
+                        entry["RiskScore"] = ext["score"]
+                        entry["Findings"] = ext["findings"]
+                except Exception as e:
+                    logger.error(f"policy {p_name} doc fetch failed: {e}")
 
-            slu = {}
-            try:
-                slu = fetch_service_last_used(iam, "policy", p_arn, account_id=account_id, max_wait=60)
-            except Exception as e:
-                logger.debug(f"ServiceLastUsed error for policy {p_name}: {e}")
-                slu = {"services": [], "last_refreshed": None, "status": "failed", "error": str(e)}
+            slu = fetch_service_last_used(iam, "policy", p_arn, account_id=account_id)
             entry["ServiceLastUsed"] = slu
 
             policies.append(entry)
+        if progress_callback:
+            progress_callback((i + 1) / (1000 // batch_size))
 
     if not fast_mode:
         for u in snapshot.get("users", []):
@@ -3549,7 +3549,7 @@ def fetch_policies(iam, account_id, fast_mode, snapshot):
                         "_inline_of": {"type": "user", "name": uname}
                     })
                 except Exception as e:
-                    pass
+                    logger.error(f"inline user policy {pname} for {uname} fetch failed: {e}")
 
         for g in snapshot.get("groups", []):
             gname = g.get("GroupName")
@@ -3569,7 +3569,7 @@ def fetch_policies(iam, account_id, fast_mode, snapshot):
                         "_inline_of": {"type": "group", "name": gname}
                     })
                 except Exception as e:
-                    pass
+                    logger.error(f"inline group policy {pname} for {gname} fetch failed: {e}")
 
         for r in snapshot.get("roles", []):
             rname = r.get("RoleName")
@@ -3589,11 +3589,12 @@ def fetch_policies(iam, account_id, fast_mode, snapshot):
                         "_inline_of": {"type": "role", "name": rname}
                     })
                 except Exception as e:
-                    pass
+                    logger.error(f"inline role policy {pname} for {rname} fetch failed: {e}")
 
     return policies
 
-# Send email alert (unchanged)
+
+# Send email alert
 def send_email_alert(impact_score, snapshot):
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = os.getenv("SMTP_PORT", 587)
@@ -3603,6 +3604,7 @@ def send_email_alert(impact_score, snapshot):
     to_email = os.getenv("TO_EMAIL")
 
     if not all([smtp_server, smtp_user, smtp_pass, from_email, to_email]):
+        logger.warning("SMTP configuration incomplete, skipping email alert")
         return
 
     msg = MIMEText(f"IAM X-Ray Alert: High impact score {impact_score}\n\nSnapshot details: {json.dumps(snapshot['_meta'], indent=2)}")
@@ -3620,14 +3622,17 @@ def send_email_alert(impact_score, snapshot):
     except Exception as e:
         logger.error(f"Failed to send email alert: {e}")
 
-# 🔑 Main Fetch with temp creds and progress
+
+# Main Fetch with temp creds, multi-region, and progress
 def fetch_iam_data(
     session=None,
     profile_name=None,
-    out_path=DEFAULT_SNAPSHOT,
+    out_path=config.SNAPSHOT_PATH,
     fast_mode=True,
     force_fetch=False,
-    encrypt=False
+    encrypt=False,
+    multi_region=False,
+    progress_callback=None
 ):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -3637,117 +3642,154 @@ def fetch_iam_data(
             logger.info("Returning cached snapshot (set force_fetch=True to refresh & compute diff).")
             return cached
 
-    # --- session handling with AssumeRole ---
     if session is None:
         session = get_boto3_session(profile_name)
-        # Assume a role for temp creds (e.g., security audit role)
-        sts = session.client("sts")
+
+    all_data = {"_meta": {
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
+        "fast_mode": fast_mode,
+        "warnings": [],
+        "diff": {}
+    }}
+    if multi_region:
+        all_data["regions"] = []
+
+    regions = config.DEFAULT_REGIONS if multi_region else [config.AWS_REGION]
+    total_regions = len(regions)
+    prev_data = _read_snapshot(out_path) if os.path.exists(out_path) else None
+
+    for i, region in enumerate(regions):
         try:
-            assumed_role = sts.assume_role(
-                RoleArn="arn:aws:iam::ACCOUNT_ID:role/SecurityAuditRole",
-                RoleSessionName="IAMXRaySession"
+            botocore_session = BotocoreSession()
+            botocore_session.set_config_variable('retries', {'max_attempts': 3, 'mode': 'standard'})
+            region_session = boto3.Session(
+                aws_access_key_id=session.get_credentials().access_key,
+                aws_secret_access_key=session.get_credentials().secret_key,
+                aws_session_token=session.get_credentials().token,
+                region_name=region,
+                botocore_session=botocore_session
             )
-            session = boto3.Session(
-                aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
-                aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
-                aws_session_token=assumed_role['Credentials']['SessionToken']
-            )
-        except ClientError as e:
-            logger.warning(f"Failed to assume role, using default creds: {e}")
-            # Fallback to default creds if role assumption fails
+            iam = region_session.client("iam")
+            sts = region_session.client("sts")
+            caller = sts.get_caller_identity()
+            account_id = caller.get("Account")
+        except (ClientError, EndpointConnectionError, NoCredentialsError, NoRegionError) as e:
+            logger.error(f"Failed to create AWS clients for region {region}: {e}")
+            all_data["_meta"]["warnings"].append(f"Region {region} failed: {e}")
+            if progress_callback:
+                progress_callback((i + 1) / total_regions)
+            continue
 
-    try:
-        iam = session.client("iam")
-        sts = session.client("sts")
-        caller = sts.get_caller_identity()
-        account_id = caller.get("Account")
-    except (ClientError, EndpointConnectionError, NoCredentialsError, NoRegionError) as e:
-        logger.error(f"Failed to create AWS clients: {e}")
-        return {"_meta": {"error": str(e)}}
+        snapshot = {
+            "_meta": {
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+                "fast_mode": bool(fast_mode),
+                "warnings": [],
+                "account_id": account_id,
+                "region": region,
+                "capabilities": {"usage_last_used": "enabled"}
+            },
+            "users": [], "groups": [], "roles": [], "policies": []
+        }
 
-    snapshot = {
-        "_meta": {
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-            "fast_mode": bool(fast_mode),
-            "warnings": [],
-            "account_id": account_id,
-            "capabilities": {"usage_last_used": "enabled"}
-        },
-        "users": [], "groups": [], "roles": [], "policies": []
-    }
+        def progress(x):
+            if progress_callback:
+                progress_callback((i / total_regions) + (x / total_regions / 4))
 
-    # Progress tracking for UI
-    progress = st.progress(0)
-    total_steps = 4  # users, groups, roles, policies
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            future_users = executor.submit(fetch_users, iam, account_id, fast_mode, progress)
+            future_groups = executor.submit(fetch_groups, iam, account_id, fast_mode, progress)
+            future_roles = executor.submit(fetch_roles, iam, account_id, fast_mode, progress)
 
-    # Parallel fetches with max_workers=8
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_users = executor.submit(fetch_users, iam, account_id, fast_mode)
-        progress.progress(1/total_steps)
-        future_groups = executor.submit(fetch_groups, iam, account_id, fast_mode)
-        progress.progress(2/total_steps)
-        future_roles = executor.submit(fetch_roles, iam, account_id, fast_mode)
-        progress.progress(3/total_steps)
+            snapshot["users"] = future_users.result()
+            snapshot["groups"] = future_groups.result()
+            snapshot["roles"] = future_roles.result()
+            progress(3 / 4)
 
-        snapshot["users"] = future_users.result()
-        snapshot["groups"] = future_groups.result()
-        snapshot["roles"] = future_roles.result()
-        progress.progress(4/total_steps)
+            future_policies = executor.submit(fetch_policies, iam, account_id, fast_mode, snapshot, progress)
+            snapshot["policies"] = future_policies.result()
 
-        # Policies depend on snapshot for inline, so sequential but with retry
-        snapshot["policies"] = fetch_policies(iam, account_id, fast_mode, snapshot)
+        logger.info(f"Fetched {len(snapshot['users'])} users, {len(snapshot['groups'])} groups, {len(snapshot['roles'])} roles, {len(snapshot['policies'])} policies in {region}")
+        _propagate_risk(snapshot)
+        _add_usage_based_findings(snapshot)
+        snapshot["_meta"]["counts"] = {
+            "users": len(snapshot.get("users", [])),
+            "groups": len(snapshot.get("groups", [])),
+            "roles": len(snapshot.get("roles", [])),
+            "policies": len(snapshot.get("policies", []))
+        }
 
-    logger.info(f"Fetched {len(snapshot['users'])} users, {len(snapshot['groups'])} groups, {len(snapshot['roles'])} roles, {len(snapshot['policies'])} policies")
+        prev_region_data = next((d for d in (prev_data.get("regions", []) if prev_data else []) if d["_meta"]["region"] == region), None)
+        if prev_region_data:
+            diff = {
+                "users": _compute_entity_diff(prev_region_data.get("users", []), snapshot["users"], "UserName"),
+                "groups": _compute_entity_diff(prev_region_data.get("groups", []), snapshot["groups"], "GroupName"),
+                "roles": _compute_entity_diff(prev_region_data.get("roles", []), snapshot["roles"], "RoleName"),
+                "policies": _compute_entity_diff(prev_region_data.get("policies", []) , snapshot["policies"], "PolicyName"),
+            }
+        else:
+            diff = {
+                "users": _compute_entity_diff([], snapshot["users"], "UserName"),
+                "groups": _compute_entity_diff([], snapshot["groups"], "GroupName"),
+                "roles": _compute_entity_diff([], snapshot["roles"], "RoleName"),
+                "policies": _compute_entity_diff([], snapshot["policies"], "PolicyName"),
+            }
+        _apply_change_flags(snapshot, diff)
+        diff["counts"] = {
+            "added": sum(len(diff[t]["added"]) for t in ["users", "groups", "roles", "policies"]),
+            "removed": sum(len(diff[t]["removed"]) for t in ["users", "groups", "roles", "policies"]),
+            "modified": sum(len(diff[t]["modified"]) for t in ["users", "groups", "roles", "policies"]),
+        }
+        risk_weight = sum(r.get("RiskScore", 0) for r in snapshot["roles"]) + sum(p.get("RiskScore", 0) for p in snapshot["policies"])
+        diff["impact_score"] = (diff["counts"]["added"] * 2 + risk_weight * 0.1) + (diff["counts"]["modified"] * 1) - (diff["counts"]["removed"] * 1)
+        snapshot["_meta"]["diff_details"] = {e: diff[e]["modified_details"] for e in ["users", "groups", "roles", "policies"]}
+        snapshot["_meta"]["diff"] = diff
 
-    # propagate risk
-    _propagate_risk(snapshot)
+        if diff["impact_score"] > config.EMAIL_ALERT_THRESHOLD:
+            send_email_alert(diff["impact_score"], snapshot)
 
-    # add usage-based findings
-    _add_usage_based_findings(snapshot)
+        if multi_region:
+            all_data["regions"].append(snapshot)
+        else:
+            all_data["users"] = snapshot["users"]
+            all_data["groups"] = snapshot["groups"]
+            all_data["roles"] = snapshot["roles"]
+            all_data["policies"] = snapshot["policies"]
+            all_data["_meta"]["counts"] = snapshot["_meta"]["counts"]
+            all_data["_meta"]["diff"] = snapshot["_meta"]["diff"]
+            all_data["_meta"]["impact_score"] = snapshot["_meta"]["diff"]["impact_score"]
 
-    snapshot["_meta"]["counts"] = {
-        "users": len(snapshot.get("users", [])),
-        "groups": len(snapshot.get("groups", [])),
-        "roles": len(snapshot.get("roles", [])),
-        "policies": len(snapshot.get("policies", []))
-    }
+        if progress_callback:
+            progress_callback((i + 1) / total_regions)
 
-    # diff vs previous
-    prev = _read_snapshot(out_path)
-    diff = {
-        "users": _compute_entity_diff(prev.get("users", []) if prev else [], snapshot["users"], "UserName"),
-        "groups": _compute_entity_diff(prev.get("groups", []) if prev else [], snapshot["groups"], "GroupName"),
-        "roles": _compute_entity_diff(prev.get("roles", []) if prev else [], snapshot["roles"], "RoleName"),
-        "policies": _compute_entity_diff(prev.get("policies", []) if prev else [], snapshot["policies"], "PolicyName"),
-    }
-    diff["counts"] = {
-        "added": sum(len(diff[t]["added"]) for t in ["users", "groups", "roles", "policies"]),
-        "removed": sum(len(diff[t]["removed"]) for t in ["users", "groups", "roles", "policies"]),
-        "modified": sum(len(diff[t]["modified"]) for t in ["users", "groups", "roles", "policies"]),
-    }
-    diff["impact_score"] = (diff["counts"]["added"] * 2) + (diff["counts"]["modified"] * 1) - (diff["counts"]["removed"] * 1)
-    snapshot["_meta"]["diff_details"] = {e: diff[e]["modified_details"] for e in ["users", "groups", "roles", "policies"]}
-    snapshot["_meta"]["diff"] = diff
+    if multi_region:
+        all_data["_meta"]["counts"] = {
+            "users": sum(r["_meta"]["counts"]["users"] for r in all_data["regions"]),
+            "groups": sum(r["_meta"]["counts"]["groups"] for r in all_data["regions"]),
+            "roles": sum(r["_meta"]["counts"]["roles"] for r in all_data["regions"]),
+            "policies": sum(r["_meta"]["counts"]["policies"] for r in all_data["regions"]),
+        }
+        all_data["_meta"]["diff"] = {
+            "counts": {
+                "added": sum(r["_meta"]["diff"]["counts"]["added"] for r in all_data["regions"]),
+                "removed": sum(r["_meta"]["diff"]["counts"]["removed"] for r in all_data["regions"]),
+                "modified": sum(r["_meta"]["diff"]["counts"]["modified"] for r in all_data["regions"]),
+            },
+            "impact_score": sum(r["_meta"]["diff"]["impact_score"] for r in all_data["regions"]) / len(regions) if all_data["regions"] else 0
+        }
 
-    # Email alert if high impact
-    if diff["impact_score"] > 5:
-        send_email_alert(diff["impact_score"], snapshot)
-
-    # --- SAVE (single latest only) ---
     try:
         if encrypt:
-            secure_store.encrypt_and_write(snapshot, out_path)
+            secure_store.encrypt_and_write(all_data, out_path)
         else:
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2, default=str)
+                json.dump(all_data, f, indent=2, default=str)
 
-        # cleanup old snapshots only after save
-        purge_old_snapshots(VERSIONED_DIR, keep_days=30)
-
+        purge_old_snapshots(os.path.join(config.DATA_DIR, "snapshots"), keep_days=config.KEEP_DAYS)
     except Exception as e:
-        snapshot["_meta"]["warnings"].append(f"write_snapshot_failed: {e}")
+        all_data["_meta"]["warnings"].append(f"write_snapshot_failed: {e}")
 
-    return snapshot
+    return all_data
 
 
 if __name__ == "__main__":
@@ -3755,17 +3797,29 @@ if __name__ == "__main__":
     parser.add_argument("--schedule", type=str, help="Schedule mode: 'daily' for daily fetch loop")
     parser.add_argument("--fast_mode", action="store_true", help="Fast mode")
     parser.add_argument("--force_fetch", action="store_true", help="Force fetch")
+    parser.add_argument("--multi_region", action="store_true", help="Enable multi-region fetching")
+    parser.add_argument("--encrypt", action="store_true", help="Encrypt snapshot")
     args = parser.parse_args()
 
     if args.schedule == "daily":
         while True:
-            s = fetch_iam_data(fast_mode=args.fast_mode, force_fetch=args.force_fetch)
+            s = fetch_iam_data(
+                fast_mode=args.fast_mode,
+                force_fetch=args.force_fetch,
+                multi_region=args.multi_region,
+                encrypt=args.encrypt
+            )
             print("Fetched counts:", s.get("_meta", {}).get("counts"))
             print("Diff:", s.get("_meta", {}).get("diff", {}).get("counts"))
             print("Impact Score:", s.get("_meta", {}).get("diff", {}).get("impact_score"))
             time.sleep(86400)  # 24 hours
     else:
-        s = fetch_iam_data(fast_mode=args.fast_mode, force_fetch=args.force_fetch)
+        s = fetch_iam_data(
+            fast_mode=args.fast_mode,
+            force_fetch=args.force_fetch,
+            multi_region=args.multi_region,
+            encrypt=args.encrypt
+        )
         print("Fetched counts:", s.get("_meta", {}).get("counts"))
         print("Diff:", s.get("_meta", {}).get("diff", {}).get("counts"))
         print("Impact Score:", s.get("_meta", {}).get("diff", {}).get("impact_score"))

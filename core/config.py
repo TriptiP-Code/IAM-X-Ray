@@ -126,21 +126,41 @@
 # # Example usage: @cache_data_compat
 # # def my_func(): ...
 
-
-
 import os
+from dotenv import load_dotenv
+load_dotenv()  # .env file se env vars load karega
 
-AWS_REGION = "us-east-1"  # Or your preferred AWS region
+# Default regions for multi-region support (used by fetch_iam.py)
+DEFAULT_REGIONS = os.getenv("DEFAULT_REGIONS", "us-east-1,us-west-2,eu-west-1").split(",")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# AWS region fallback (used if no session region specified)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# OpenAI API key (optional, can be None for local dev)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 
 # Cache TTL in seconds (default 1 hour)
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
+try:
+    CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
+except ValueError:
+    CACHE_TTL = 3600  # Fallback to 1 hour if invalid
 
-# Security: Mandatory FERNET_KEY for encryption
-FERNET_KEY = os.getenv("FERNET_KEY")
+# Security: Mandatory FERNET_KEY for encryption (used by secure_store.py)
+FERNET_KEY = os.getenv("IAM_XRAY_FERNET_KEY")  # Changed from "FERNET_KEY" to "IAM_XRAY_FERNET_KEY"
 if not FERNET_KEY:
-    raise ValueError("FERNET_KEY is required for secure encryption")
+    raise ValueError("IAM_XRAY_FERNET_KEY environment variable not set")
 
-# Nice-to-have: Email alert threshold (default 5)
-EMAIL_ALERT_THRESHOLD = int(os.getenv("EMAIL_THRESHOLD", "5"))
+# Email alert threshold (default 5, used by fetch_iam.py)
+try:
+    EMAIL_ALERT_THRESHOLD = int(os.getenv("EMAIL_THRESHOLD", "5"))
+except ValueError:
+    EMAIL_ALERT_THRESHOLD = 5  # Fallback to 5 if invalid
+
+
+    # core/config.py
+DATA_DIR = "data"  # Base directory for data storage
+SNAPSHOT_PATH = "data/iam_snapshot.json"  # Path for the current snapshot
+DEFAULT_REGIONS = ["us-east-1", "us-west-2"]  # Add regions as needed
+AWS_REGION = "us-east-1"  # Default region
+EMAIL_ALERT_THRESHOLD = 5  # Threshold for sending email alerts
+KEEP_DAYS = 30  # Number of days to keep snapshots

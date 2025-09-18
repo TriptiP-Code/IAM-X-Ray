@@ -276,11 +276,16 @@
 # encrypt_and_write = write_encrypted
 # decrypt_and_read = read_and_decrypt
 
-import os, json
+import os
+import json
 from cryptography.fernet import Fernet
 import logging
 from datetime import datetime, timedelta
 from functools import lru_cache
+import time
+from core import config 
+# Import config to sync with FERNET_KEY
+# Changed to relative
 
 logger = logging.getLogger("secure_store")
 logger.setLevel(logging.INFO)
@@ -289,7 +294,7 @@ if not logger.handlers:
     ch.setLevel(logging.INFO)
     logger.addHandler(ch)
 
-DEFAULT_KEY_ENV = "IAM_XRAY_FERNET_KEY"
+DEFAULT_KEY_ENV = "IAM_XRAY_FERNET_KEY"  # Keep this for fallback/env check
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 KEYS_FILE = os.path.join(DATA_DIR, "fernet-keys.json")
@@ -298,10 +303,14 @@ KEYS_FILE = os.path.join(DATA_DIR, "fernet-keys.json")
 def _load_or_create_keys():
     keys = []
 
-    # 1) ENV var highest priority
-    env_key = os.getenv(DEFAULT_KEY_ENV)
-    if env_key:
-        keys.append(env_key.encode())
+    # 1) Use FERNET_KEY from config (highest priority)
+    if config.FERNET_KEY:
+        keys.append(config.FERNET_KEY.encode())
+    else:
+        # Fallback to env var if config key not set
+        env_key = os.getenv(DEFAULT_KEY_ENV)
+        if env_key:
+            keys.append(env_key.encode())
 
     # 2) Existing keys file
     created_at = None
@@ -313,9 +322,11 @@ def _load_or_create_keys():
                 if isinstance(k, str):
                     keys.append(k.encode())
             created_at = raw.get("created_at")
+        except json.JSONDecodeError as e:
+            logger.error(f"Corrupted keys file, regenerating: {e}")
+            os.remove(KEYS_FILE)  # Remove corrupted file
         except Exception as e:
             logger.error(f"Failed to load keys file: {e}")
-            raise
 
     # 3) If no keys → generate new
     if not keys:
@@ -333,45 +344,84 @@ def _load_or_create_keys():
             if datetime.utcnow() - created_dt > timedelta(days=90):
                 logger.info("Rotating encryption key (older than 90 days)")
                 new_k = Fernet.generate_key()
-                keys.append(new_k)  # Append new key
+                keys.append(new_k)
                 with open(KEYS_FILE, "w") as f:
                     json.dump({"keys": [k.decode() for k in keys], "created_at": datetime.utcnow().isoformat()}, f, indent=2)
-                # Placeholder for email alert (to be implemented in fetch_iam.py)
+                # Placeholder for email alert (to be implemented in config.py)
                 logger.info("Key rotation completed; email alert pending implementation")
+        except PermissionError as e:
+            logger.error(f"Key rotation failed due to permissions: {e}")
         except Exception as e:
             logger.error(f"Key rotation failed: {e}")
 
     return keys
 
 FERNET_KEYS = _load_or_create_keys()
-PRIMARY_KEY = FERNET_KEYS[-1] if FERNET_KEYS else None  # Use latest key for encryption
-if not PRIMARY_KEY:
-    raise RuntimeError("No encryption key available")
-fernet_primary = Fernet(PRIMARY_KEY)
-FERNET_INSTANCES = [Fernet(k) for k in FERNET_KEYS]
+PRIMARY_KEY = FERNET_KEYS[-1] if FERNET_KEYS else None
+fernet_primary = Fernet(PRIMARY_KEY) if PRIMARY_KEY else None
+FERNET_INSTANCES = [Fernet(k) for k in FERNET_KEYS] if FERNET_KEYS else []
 
-@lru_cache(maxsize=1)
-def encrypt_and_write(obj, path: str):
+def encrypt_and_write(obj, path: str, max_retries=3):
     if not fernet_primary:
-        raise RuntimeError("Encryption required but no key available")
+        logger.warning("No encryption key; writing plaintext JSON")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        return
     
     raw = json.dumps(obj, indent=2).encode()
-    enc = fernet_primary.encrypt(raw)
-    with open(path, "wb") as f:
-        f.write(enc)
-    logger.info(f"Snapshot encrypted and written to {path}")
-    # Verify policy data is encrypted (basic check)
-    if "policies" in json.dumps(obj):
-        logger.info("Policy data successfully encrypted")
-
-def decrypt_and_read(path: str):
-    with open(path, "rb") as f:
-        raw = f.read()
-    for idx, fernet in enumerate(FERNET_INSTANCES):
+    enc_data = fernet_primary.encrypt(raw)
+    for attempt in range(max_retries):
         try:
-            dec = fernet.decrypt(raw)
-            logger.info(f"Decrypted snapshot using key index {idx}")
-            return json.loads(dec.decode())
-        except Exception:
-            continue
-    raise RuntimeError("Unable to decrypt snapshot; no valid key found")
+            with open(path, "wb") as f:
+                chunk_size = 8192
+                for i in range(0, len(enc_data), chunk_size):
+                    f.write(enc_data[i:i + chunk_size])
+            logger.info(f"Snapshot encrypted and written to {path}")
+            # Verify policy data is encrypted (basic check)
+            if "policies" in json.dumps(obj):
+                logger.info("Policy data successfully encrypted")
+            break
+        except IOError as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to write after {max_retries} attempts: {e}")
+                raise
+            time.sleep(1)  # Wait before retry
+            logger.warning(f"Retry {attempt + 1}/{max_retries} due to I/O error: {e}")
+
+def decrypt_and_read(path: str, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            with open(path, "rb") as f:
+                raw = b""
+                chunk_size = 8192
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    raw += chunk
+            for idx, fernet in enumerate(FERNET_INSTANCES):
+                try:
+                    dec = fernet.decrypt(raw)
+                    logger.info(f"Decrypted snapshot using key index {idx}")
+                    return json.loads(dec.decode())
+                except Exception:
+                    continue
+            # Fallback plain if decryption fails
+            try:
+                logger.warning("Decryption failed; assuming plaintext")
+                return json.loads(raw.decode())
+            except Exception:
+                raise RuntimeError("Unable to decrypt or read snapshot")
+        except IOError as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to read after {max_retries} attempts: {e}")
+                raise
+            time.sleep(1)  # Wait before retry
+            logger.warning(f"Retry {attempt + 1}/{max_retries} due to I/O error: {e}")
+
+# # Example usage (for testing)
+# if __name__ == "__main__":
+#     test_data = {"policies": [{"name": "test", "data": "secret"}]}
+#     encrypt_and_write(test_data, "test_encrypted.json")
+#     decrypted = decrypt_and_read("test_encrypted.json")
+#     print(decrypted)

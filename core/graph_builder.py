@@ -2391,6 +2391,7 @@
 #     succs = sorted([n for n in G.successors(node)]) if hasattr(G, "successors") else []
 #     return preds, succs
 
+# core/graph_builder.py
 import networkx as nx
 from pyvis.network import Network
 import tempfile
@@ -2400,9 +2401,11 @@ import re
 import json
 import difflib
 from datetime import datetime, timedelta
-import streamlit as st
 
-from core import secure_store
+from core import secure_store   # 🔑 new import for encrypted snapshot support
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("graph_builder")
 
 NODE_COLORS = {
     "user": "#3B82F6",     # Blue
@@ -2413,7 +2416,7 @@ NODE_COLORS = {
 }
 
 MAX_NODES = 500  # Limit for large graphs
-
+CLUSTER_THRESHOLD = 1000  # Threshold for clustering
 # ================== NEW HELPERS ==================
 
 def load_snapshot(path):
@@ -2421,7 +2424,7 @@ def load_snapshot(path):
     Load IAM snapshot - supports both encrypted and plaintext.
     """
     try:
-        return secure_store.decrypt_and_read(path)
+        return secure_store.read_and_decrypt(path)
     except Exception:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -2433,15 +2436,11 @@ RISKY_PATTERNS = [
     r"s3:\*",
     r"kms:\*",
     r"ec2:\*",
-    r"lambda:InvokeFunction",  # Expanded pattern
-    r"no:Condition",           # Expanded pattern
 ]
 
-@st.cache_data
 def analyze_policy_document(doc):
     """
     Scan a policy document and return risky findings (actions with wildcards or sensitive services).
-    Also checks for least-privilege violations.
     """
     findings = []
     if not isinstance(doc, dict):
@@ -2450,11 +2449,6 @@ def analyze_policy_document(doc):
     stmts = doc.get("Statement", [])
     if isinstance(stmts, dict):
         stmts = [stmts]
-
-    # Extract used services from ServiceLastUsed (if available)
-    used_services = set()
-    slu = doc.get("ServiceLastUsed", {}).get("services", [])
-    used_services = {s.get("serviceNamespace") for s in slu if s.get("lastAuthenticated")}
 
     for stmt in stmts:
         actions = stmt.get("Action") or stmt.get("NotAction")
@@ -2466,17 +2460,9 @@ def analyze_policy_document(doc):
             for pat in RISKY_PATTERNS:
                 if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
                     findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
-            # Least-privilege check
-            if used_services and act.split(":")[0] not in used_services:
-                findings.append({
-                    "action": act,
-                    "pattern": "UNUSED_SERVICE",
-                    "effect": stmt.get("Effect", "Allow"),
-                    "message": f"Action {act} not used recently (least-privilege violation)"
-                })
     return findings
 
-@st.cache_data
+
 def search_permissions(G, query):
     """
     Search who can perform a given action, or what a given entity can do.
@@ -2544,22 +2530,6 @@ def search_permissions(G, query):
                     entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
             results["entity"] = dict(attrs)
             results["entity_attached_findings"] = entity_findings
-
-        # Add escalation paths if user/group
-        if node_type in ("user", "group"):
-            # Find high-risk targets: roles with high score or "admin" in name
-            high_risk_roles = [n for n, a in G.nodes(data=True) if a.get("type") == "role" and (a.get("risk_score", 0) > 8 or "admin" in n.lower())]
-            escalation_paths = []
-            for target in high_risk_roles:
-                try:
-                    paths = list(nx.all_shortest_paths(G, source=target_node, target=target))
-                    if paths:
-                        escalation_paths.append({"target": target, "paths": paths})
-                except nx.NetworkXNoPath:
-                    pass
-            if escalation_paths:
-                results["escalation_paths"] = escalation_paths
-
     else:
         # No exact node → suggest fuzzy matches
         close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
@@ -2574,7 +2544,7 @@ def _node_label(name, kind, risky=False, score=0):
     prefix = {
         "user": "👤 ",
         "group": "👥 ",
-        "role": "👥 ",
+        "role": "🎭 ",
         "policy": "📜 ",
         "principal": "🔑 "
     }.get(kind, "")
@@ -2591,7 +2561,7 @@ def _risk_color(score):
     score = max(0, min(score, 10))
     r = int((score / 10) * 255)
     g = int(((10 - score) / 10) * 200)
-    b = 60 + int((score / 10) * 100)  # Add slight blue gradient for better visual
+    b = 60
     return f"rgb({r},{g},{b})"
 
 def compute_keep_set_from_diff(snapshot):
@@ -2616,7 +2586,6 @@ def build_adjacency(G):
     return adj
 
 def export_graph_json(G, path="graph.json"):
-    """Export NetworkX graph to JSON file."""
     data = {
         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
@@ -2626,35 +2595,31 @@ def export_graph_json(G, path="graph.json"):
     return path
 
 def build_graph(snapshot, show_only_risky=False):
-    """
-    Pure graph builder (no HTML). Returns a NetworkX.DiGraph.
-    Mirrors build_iam_graph's node/edge logic.
-    """
+    if not snapshot or not any(key in snapshot for key in ["users", "groups", "roles", "policies"]):
+        logger.warning("Invalid or empty snapshot data")
+        return nx.DiGraph()
+
     G = nx.DiGraph()
 
-    # Check for large graphs and apply subgraph if needed
     total_entities = len(snapshot.get("users", [])) + len(snapshot.get("groups", [])) + len(snapshot.get("roles", [])) + len(snapshot.get("policies", []))
     if total_entities > MAX_NODES:
-        logging.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling changed nodes.")
+        logger.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling changed nodes.")
         keep_set = compute_keep_set_from_diff(snapshot)
         if keep_set:
             G = nx.subgraph(G, keep_set)
 
-    # Users
     for u in snapshot.get("users", []):
         name = u.get("UserName")
         if name:
             risky = bool(u.get("IsRisky"))
             G.add_node(name, type="user", risky=risky, meta=u)
 
-    # Groups
     for g in snapshot.get("groups", []):
         gname = g.get("GroupName")
         if not gname:
             continue
         risky = bool(g.get("IsRisky"))
         G.add_node(gname, type="group", risky=risky, meta=g)
-
         for ap in g.get("AttachedPolicies", []) or []:
             pname = ap.get("PolicyName")
             if pname:
@@ -2662,7 +2627,6 @@ def build_graph(snapshot, show_only_risky=False):
                     G.add_node(pname, type="policy", risky=False, meta={})
                 G.add_edge(gname, pname, relation="attached")
 
-    # Roles
     for r in snapshot.get("roles", []):
         rname = r.get("RoleName")
         if not rname:
@@ -2670,25 +2634,19 @@ def build_graph(snapshot, show_only_risky=False):
         role_risk = bool(r.get("AssumePolicyRisk"))
         role_score = r.get("AssumePolicyRiskScore") or 0
         G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
-
         for ap in r.get("AttachedPolicies", []) or []:
             pname = ap.get("PolicyName")
             if pname:
                 if not G.has_node(pname):
                     G.add_node(pname, type="policy", risky=False, meta={})
                 G.add_edge(rname, pname, relation="attached")
-
         for pr in r.get("PrincipalsInfo") or []:
             short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
             node_name = f"PRINC:{short}"
             if not G.has_node(node_name):
-                G.add_node(
-                    node_name, type="principal", risky=False,
-                    meta={"principal": pr.get("value"), "principal_type": pr.get("type")}
-                )
+                G.add_node(node_name, type="principal", risky=False, meta={"principal": pr.get("value"), "principal_type": pr.get("type")})
             G.add_edge(node_name, rname, relation="assumes")
 
-    # Policies
     for p in snapshot.get("policies", []):
         pname = p.get("PolicyName")
         if pname:
@@ -2696,7 +2654,6 @@ def build_graph(snapshot, show_only_risky=False):
             score = p.get("RiskScore") or 0
             G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
 
-    # User → group/policy edges
     for u in snapshot.get("users", []):
         uname = u.get("UserName")
         for gname in u.get("Groups", []) or []:
@@ -2709,7 +2666,6 @@ def build_graph(snapshot, show_only_risky=False):
                     G.add_node(pname, type="policy", risky=False, meta={})
                 G.add_edge(uname, pname, relation="attached")
 
-    # Risky-only filter using subgraph_view
     if show_only_risky:
         def filter_node(n):
             return G.nodes[n].get("risky", False)
@@ -2719,24 +2675,28 @@ def build_graph(snapshot, show_only_risky=False):
 
     return G
 
-# ---------- UI graph builder (PyVis HTML) ----------
 def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
                     highlight_color="#ffeb3b", highlight_duration=2200):
-    """
-    Build IAM graph.
-    Returns: (G, html_str, clicked_node, export_data)
-    """
-    # build pure graph first
-    G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-    G = G_full  # alias expected by callers
+    if not snapshot or not any(key in snapshot for key in ["users", "groups", "roles", "policies"]):
+        logger.warning("Invalid or empty snapshot data")
+        return nx.DiGraph(), "<div>No data to display</div>", None, b"{}"
 
-    # Subgraph for large graphs based on diff
+    G_full = build_graph(snapshot, show_only_risky=show_only_risky)
+    G = G_full
+
     if len(G.nodes) > MAX_NODES:
         keep_set = compute_keep_set_from_diff(snapshot)
         if keep_set:
             G = nx.subgraph(G_full, keep_set)
+    if len(G.nodes) > CLUSTER_THRESHOLD:
+        logger.info(f"Applying clustering for {len(G.nodes)} nodes")
+        communities = nx.community.greedy_modularity_communities(G)
+        for i, comm in enumerate(communities):
+            cluster_name = f"Cluster_{i}"
+            G.add_node(cluster_name, type="cluster", size=30)
+            for node in comm:
+                G.add_edge(cluster_name, node, relation="cluster_member")
 
-    # === PyVis Graph ===
     net = Network(height="760px", width="100%", notebook=False, directed=True)
     net.set_options("""
     {
@@ -2750,22 +2710,16 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
 
     impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
 
-    # Batch add nodes
     node_list = []
     for node, attrs in G.nodes(data=True):
         ntype = attrs.get("type", "node")
         risky = attrs.get("risky", False)
         meta = attrs.get("meta", {})
         score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
-
         change_flag = meta.get("_changed")
-        change_details = ""
-        if change_flag == "added":
-            change_details = "➕ Added"
-        elif change_flag == "modified":
-            change_details = "🔄 Modified"
+        change_details = "➕ Added" if change_flag == "added" else "🔄 Modified" if change_flag == "modified" else ""
 
-        # ---- tooltips with Findings count / TrustFindings count ----
+        tlines = []
         if ntype == "policy":
             findings = meta.get("Findings") or []
             findings_count = len(findings)
@@ -2786,10 +2740,8 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
                 f"Findings: 0 ✅ No risky actions",
                 change_details
             ]
-            # Add usage hints to tooltips
             slu = meta.get("ServiceLastUsed", {})
-            services = slu.get("services", [])
-            unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
+            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
             if unused:
                 tlines.append("Unused services: " + ", ".join(unused))
         elif ntype == "role":
@@ -2802,32 +2754,22 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
                 f"TrustFindings: {trust_find_count}",
                 change_details
             ]
-            # Add usage hints to tooltips
             slu = meta.get("ServiceLastUsed", {})
-            services = slu.get("services", [])
-            unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
+            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
             if unused:
                 tlines.append("Unused services: " + ", ".join(unused))
         elif ntype == "principal":
-            tlines = [
-                f"Principal: {meta.get('principal')}",
-                f"Type: {meta.get('principal_type')}",
-                change_details
-            ]
+            tlines = [f"Principal: {meta.get('principal')}", f"Type: {meta.get('principal_type')}", change_details]
         else:
-            # user/group default
             tlines = [str(meta), change_details]
-            # Add usage hints for user/group if available
             slu = meta.get("ServiceLastUsed", {})
-            services = slu.get("services", [])
-            unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
+            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
             if unused:
                 tlines.append("Unused services: " + ", ".join(unused))
 
         color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
         if risky and not score:
             color = "#FF6B6B"
-
         size = 18 + (score * 2) if score else 18
         if node == highlight_node:
             size = max(size, 36)
@@ -2844,10 +2786,8 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
                   title=[n["title"] for n in node_list], color=[n["color"] for n in node_list],
                   size=[n["size"] for n in node_list])
 
-    # Batch edges - but since add_edges may not support all kwargs in batch, loop add_edge
     for u, v, ed in G.edges(data=True):
         rel = ed.get("relation", "")
-        # Edge severity: color red if source or target risky, thickness based on scores
         u_attrs = G.nodes[u]
         v_attrs = G.nodes[v]
         u_risky = u_attrs.get("risky", False)
@@ -2855,18 +2795,16 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
         u_score = u_attrs.get("risk_score", 0) or 0
         v_score = v_attrs.get("risk_score", 0) or 0
         edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-        # Gray if target policy has unused actions
         if v_attrs.get("type") == "policy":
             findings = v_attrs.get("meta", {}).get("Findings") or []
             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
             if unused_count > 0:
                 edge_color = "#CCCCCC"
-        edge_width = 1 + int((u_score + v_score) / 5)  # Scale thickness (max ~5)
+        edge_width = 1 + int((u_score + v_score) / 5)
         if rel == "assumes":
-            edge_width += 1  # Slightly thicker for assumes
+            edge_width += 1
         net.add_edge(u, v, title=rel, width=edge_width, color=edge_color)
 
-    # Export options data
     export_data = export_graph_json(G)
 
     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
@@ -2876,7 +2814,6 @@ def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
     with open(html_path, "r", encoding="utf-8") as f:
         html_str = f.read()
 
-    # === Legend with toggle (color matched to NODE_COLORS) ===
     legend_html = f"""
 <div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;display:none;">
   <div style="font-weight:700;margin-bottom:6px;">Legend</div>
@@ -2904,30 +2841,15 @@ function toggleLegend(){{
         color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
         impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
 
-    # ---- Highlight JS with configurable color/duration ----
-    # Ensure highlight_color and highlight_duration are valid
     try:
-        highlight_color = str(highlight_color)  # Convert to string if not already
-        highlight_duration = int(highlight_duration)  # Ensure integer
+        highlight_color = str(highlight_color)
+        highlight_duration = int(highlight_duration)
         highlight_js = """
 <script type="text/javascript">
 let permanentHighlight = false;
-function togglePermanentHighlight() {
-    permanentHighlight = !permanentHighlight;
-    // Optionally persist or update UI
-}
-function _getNodeColor(id) {
-    try {
-        const n = network.body.data.nodes.get(id);
-        if(!n) return null;
-        if(typeof n.color === 'string') return n.color;
-        if(n.color && n.color.background) return n.color.background;
-        return null;
-    } catch(e) { return null; }
-}
-function _updateNodeColors(updates) {
-    try { network.body.data.nodes.update(updates); } catch(e) {}
-}
+function togglePermanentHighlight() { permanentHighlight = !permanentHighlight; }
+function _getNodeColor(id) { try { return network.body.data.nodes.get(id).color.background; } catch(e) { return null; } }
+function _updateNodeColors(updates) { try { network.body.data.nodes.update(updates); } catch(e) {} }
 function highlightPath(nodeId) {
     if(!nodeId) return;
     const connected = network.getConnectedNodes(nodeId) || [];
@@ -2946,7 +2868,7 @@ function highlightPath(nodeId) {
     }).filter(x=>x);
     try { network.body.data.edges.update(edgeUpdates); } catch(e) {}
     if (!permanentHighlight) {
-        setTimeout(()=> {
+        setTimeout(() => {
             const restoreNodes = Object.keys(original).map(id => {
                 const orig = original[id];
                 if(orig) return {id: id, color: {background: orig}};
@@ -2973,9 +2895,8 @@ try {
 } catch(e){}
 </script>
 """.format(COLOR=highlight_color, DURATION=highlight_duration)
-        print(f"Formatted highlight_js: {highlight_js}")  # Debug print
     except (ValueError, TypeError) as e:
-        # st.warning(f"Invalid highlight parameters: {e}. Using defaults.")
+        # logger.warning(f"Invalid highlight parameters: {e}. Using defaults.")
         highlight_js = """
 <script type="text/javascript">
 let permanentHighlight = false;
@@ -2987,18 +2908,15 @@ network.on("click", function(params) { if (params.nodes.length > 0) { const clic
 </script>
 """
 
-    # Inject overlays + highlight script with debug
     try:
         html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-        html_str = re.sub(r"(</body>)", highlight_js + r"\g<0>", html_str, flags=re.IGNORECASE)  # Changed \\1 to \g<0>
-        print(f"Final html_str length: {len(html_str)}")  # Debug print
+        html_str = re.sub(r"(</body>)", highlight_js + r"\g<0>", html_str, flags=re.IGNORECASE)
     except Exception as e:
-        st.error(f"Error injecting HTML: {e}")
-        raise
+        logger.error(f"Error injecting HTML: {e}")
+        html_str = "<div>Error rendering graph</div>"
 
     clicked_node = None
     return G, html_str, clicked_node, export_data
 
 def export_graph_json(G):
-    # Logic to convert graph to JSON with explicit edges parameter
     return json.dumps(nx.node_link_data(G, edges="links")).encode()

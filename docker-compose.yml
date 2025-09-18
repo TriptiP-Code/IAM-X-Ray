@@ -7,6 +7,10 @@ services:
       - "8501:8501"
     environment:
       - IAM_XRAY_FERNET_KEY=${IAM_XRAY_FERNET_KEY}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - KEEP_DAYS=${KEEP_DAYS}
     volumes:
       - ./data:/app/data
-    user: "${UID:-1000}:${GID:-1000}"
+    restart: unless-stopped

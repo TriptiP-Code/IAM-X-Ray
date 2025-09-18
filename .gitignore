@@ -1,4 +1,4 @@
-# --- Python ---
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,34 +7,45 @@ __pycache__/
 .eggs/
 *.log
 
-# --- Virtual environments ---
+# Virtual environments
 venv/
 .env/
 .venv/
 
-# --- Streamlit cache ---
+# Streamlit cache
 .streamlit/
 
-# --- Local data & secrets ---
+# Local data & secrets
 data/
 *.db
 *.sqlite
 auth.json
 setup.lock
 
-# --- Config / Secrets ---
+# Config / Secrets
 .env
-config.py
+secrets.toml
 
-# --- Docker ---
+# Docker
 *.pid
 *.sock
-*.log
 *.tmp
 
-# --- OS crap ---
+# OS
 .DS_Store
 Thumbs.db
 
-config.py
-lib
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build
+build/
+dist/
+*.egg

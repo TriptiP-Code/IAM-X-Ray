@@ -2,4 +2,10 @@ data/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+*.log
 .env
+secrets.toml

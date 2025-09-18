@@ -1531,7 +1531,7 @@
 # });
 # </script>
 # """)
-
+# app/main.py
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import os, json, hashlib, secrets, streamlit as st
@@ -1541,9 +1541,10 @@ from copy import deepcopy
 from io import StringIO
 from datetime import datetime as dt, timedelta
 import time
+from botocore.exceptions import ClientError  # Added for ClientError
 import re
 import csv
-from concurrent.futures import ThreadPoolExecutor
+import urllib.parse
 from core.compat import rerun
 from core.fetch_iam import fetch_iam_data
 from core.graph_builder import (
@@ -1552,10 +1553,145 @@ from core.graph_builder import (
     compute_keep_set_from_diff,
     build_adjacency,
     search_permissions,
-    load_snapshot,
+    load_snapshot,  # 👈 encrypted/plain snapshot loader
 )
-
+from core.cleanup import ui_purge_button  # Assuming this is available from cleanup.py
 st.set_page_config(page_title="IAM X-Ray", layout="wide", initial_sidebar_state="expanded")
+
+# Helper function to ensure input is a list
+def _ensure_list(item):
+    """Convert item to a list if it is not already a list."""
+    if isinstance(item, list):
+        return item
+    return [item]
+
+AUTH_FILE = "data/auth.json"
+LOCK_FILE = "data/setup.lock"   # 👈 lock file
+
+def hash_pw(pw: str, salt: str) -> str:
+    return hashlib.sha256((salt + pw).encode()).hexdigest()
+
+os.makedirs("data", exist_ok=True)
+
+# For SCC compatibility: Use st.secrets if available
+if "PASSWORD" in st.secrets:
+    # Cloud mode: Fixed password from secrets
+    saved_hash = st.secrets["PASSWORD_HASH"]
+    salt = st.secrets["SALT"]
+else:
+    # Local mode: Use file
+    if not os.path.exists(AUTH_FILE) and not os.path.exists(LOCK_FILE):
+        st.title("🔐 IAM X-Ray — Setup")
+        pw1 = st.text_input("Set a new password", type="password")
+        pw2 = st.text_input("Confirm password", type="password")
+        if st.button("Save password"):
+            if pw1 and pw1 == pw2:
+                salt = secrets.token_hex(16)
+                hashed = hash_pw(pw1, salt)
+                with open(AUTH_FILE, "w") as f:
+                    json.dump({
+                        "algorithm": "sha256",
+                        "salt": salt,
+                        "password_hash": hashed
+                    }, f, indent=2)
+                # 👇 create lock file so reset needs manual deletion
+                with open(LOCK_FILE, "w") as f:
+                    f.write("locked")
+                st.success("✅ Password set! Restart app and login.")
+            else:
+                st.error("❌ Passwords do not match")
+        st.stop()
+
+    # --------- RESET BLOCK (auth.json missing but lock exists) ---------
+    if not os.path.exists(AUTH_FILE) and os.path.exists(LOCK_FILE):
+        st.error("⚠️ Auth reset disabled. Delete auth.json + setup.lock manually to reset.")
+        st.stop()
+
+    with open(AUTH_FILE, "r") as f:
+        auth_data = json.load(f)
+
+    salt = auth_data["salt"]
+    saved_hash = auth_data["password_hash"]
+
+# Use JS for persistent auth across restarts (local storage)
+components.html("""
+<script>
+function getAuthToken() {
+    return localStorage.getItem('iam_xray_auth_token');
+}
+
+function setAuthToken(token) {
+    localStorage.setItem('iam_xray_auth_token', token);
+}
+
+function clearAuthToken() {
+    localStorage.removeItem('iam_xray_auth_token');
+}
+
+window.parent.postMessage({type: "iam_xray_auth_token", token: getAuthToken()}, "*");
+</script>
+""", height=0)
+
+# Check if authenticated
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+auth_token = st.experimental_get_query_params().get("auth_token", [None])[0]
+if auth_token and auth_token == "valid_token":  # Simple token check, improve with hash
+    st.session_state["authenticated"] = True
+
+if not st.session_state["authenticated"]:
+    st.title("🔐 IAM X-Ray Login")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hash_pw(pw, salt) == saved_hash:
+            st.session_state["authenticated"] = True
+            # Set token in local storage
+            components.html("""
+            <script>
+            setAuthToken('valid_token');
+            </script>
+            """, height=0)
+            rerun()
+        else:
+            st.error("❌ Wrong password")
+    # Forgot password button
+    if st.button("Forgot Password?"):
+        st.title("Forgot Password")
+        email = st.text_input("Enter your email for reset link")
+        if st.button("Send Reset Link"):
+            st.success("Reset link sent to your email.")  # Placeholder, integrate real email if needed
+            # Clear token
+            components.html("""
+            <script>
+            clearAuthToken();
+            </script>
+            """, height=0)
+    st.stop()
+
+
+
+# ---- CSS
+st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+html, body, [data-testid="stAppViewContainer"] { font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial; }
+h1 { font-size: 28px; font-weight: 700; margin-bottom: 2px; }
+.graph-card { border-radius: 12px; padding: 10px; background: #0b0f19; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.detail-card { border-radius: 12px; padding: 14px; background: #0b0f19; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.tip { color:#97a0af; font-size: 13px; }
+.badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; color:#fff; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("<h1>🔐 IAM X-Ray — Visual AWS Access Map</h1>", unsafe_allow_html=True)
+
+DATA_DIR = "data"
+SNAPSHOT_PATH = os.path.join(DATA_DIR, "iam_snapshot.json")
+DEMO_PATH = os.path.join(DATA_DIR, "sample_snapshot.json")
+
+# ensure data dir exists
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---- SIDEBAR
 if "sidebar_collapsed" not in st.session_state:
@@ -1570,8 +1706,6 @@ with st.sidebar:
     controls_expanded = not st.session_state["sidebar_collapsed"]
     with st.expander("Controls", expanded=controls_expanded):
         st.header("Controls")
-
-        dark_mode = st.checkbox("Dark Mode", value=True)
 
         # --- Auth block ---
         auth_mode = st.radio("Auth mode", ["Demo", "AWS Profile", "Env Keys"], index=0)
@@ -1604,39 +1738,9 @@ with st.sidebar:
         # --- Fetch options ---
         fast_mode = st.checkbox("⚡ Fast fetch (seconds)", value=True)
         force = st.checkbox("Force fetch (ignore cache)", value=False)
-        encrypt = st.checkbox("🔒 Encrypt snapshot", value=True)  # Default to True
-        if not encrypt:
-            st.warning("Encryption off – IAM data at risk")
+        encrypt = st.checkbox("🔒 Encrypt snapshot", value=False)
 
-        auto_refresh = st.checkbox("Auto-fetch every 5 min")
-        if auto_refresh:
-            st.warning("This may incur API costs")
-
-        if "login_time" not in st.session_state:
-            st.session_state["login_time"] = dt.now()
-        if (dt.now() - st.session_state["login_time"]) > timedelta(hours=1):
-            st.session_state["authenticated"] = False
-            st.error("Session expired. Please restart the app.")
-            st.stop()
-
-        # Fetch data with session state and trigger
-        if "data" not in st.session_state or force or (auto_refresh and (dt.now() - st.session_state.get("last_fetch_time", dt.min)).total_seconds() > 300):
-            with st.spinner("Fetching IAM data..."):
-                try:
-                    with ThreadPoolExecutor() as executor:
-                        future = executor.submit(fetch_iam_data, session, profile or None, "data/iam_snapshot.json", fast_mode, force, encrypt)
-                        st.session_state["data"] = future.result()
-                    st.session_state["last_fetch_time"] = dt.now()
-                    st.sidebar.success("Snapshot fetched successfully.")
-                except Exception as e:
-                    st.session_state["data"] = None
-                    st.sidebar.error(f"Fetch failed: {e}")
-        else:
-            if st.session_state.get("data"):
-                st.sidebar.success("Snapshot fetched successfully.")
-            else:
-                st.sidebar.error("Fetch failed. Check logs for details.")
-
+        fetch_btn = st.button("🔁 Fetch latest IAM snapshot")
         show_only_risky = st.checkbox("Show only risky paths", value=False)
         show_only_changes = st.checkbox("Show only changes (added/modified + neighbors)", value=False)
         min_score = st.slider("Min risk score (0-10)", 0, 10, 0)
@@ -1646,47 +1750,38 @@ with st.sidebar:
         q_default = st.session_state.get("search_query", "")
         q = st.text_input("Search action or entity", value=q_default,
                           placeholder="e.g. s3:PutObject  •  iam:PassRole  •  MyPolicy  •  alice")
-        if q and not (":" in q or re.match(r"^[a-zA-Z0-9:-]*$", q)):
-            st.error("Invalid input")
         run_search = st.button("Search")
         if run_search:
             st.session_state["search_query"] = q or ""
 
-# ---- CSS (conditional on dark_mode)
-css = """
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
-html, body, [data-testid="stAppViewContainer"] { font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial; background: #fff; color: #000; }
-h1 { font-size: 28px; font-weight: 700; margin-bottom: 2px; }
-.graph-card { border-radius: 12px; padding: 10px; background: #f0f0f0; box-shadow: 0 4px 12px rgba(0,0,0,.1); }
-.detail-card { border-radius: 12px; padding: 14px; background: #f0f0f0; box-shadow: 0 4px 12px rgba(0,0,0,.1); }
-.tip { color:#6b7280; font-size: 13px; }
-.badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; color:#000; }
-@media (max-width: 768px) { .graph-card { padding: 5px; } [data-testid="stSidebar"] { width: 100%; } }
-</style>""" if not dark_mode else """
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
-html, body, [data-testid="stAppViewContainer"] { font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial; background: #0b0f19; color: #fff; }
-h1 { font-size: 28px; font-weight: 700; margin-bottom: 2px; }
-.graph-card { border-radius: 12px; padding: 10px; background: #0b0f19; box-shadow: 0 4px 12px rgba(0,0,0,.25); }
-.detail-card { border-radius: 12px; padding: 14px; background: #0b0f19; box-shadow: 0 4px 12px rgba(0,0,0,.25); }
-.tip { color:#97a0af; font-size: 13px; }
-.badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; color:#fff; }
-@media (max-width: 768px) { .graph-card { padding: 5px; } [data-testid="stSidebar"] { width: 100%; } }
-</style>"""
-st.markdown(css, unsafe_allow_html=True)
+# ---- Fetch / Load Snapshot
+# Auto-select DEMO_PATH when Demo mode is active (no need to click fetch)
+active_snapshot_path = DEMO_PATH if auth_mode == "Demo" else SNAPSHOT_PATH
 
-st.markdown("<h1>🔐 IAM X-Ray — Visual AWS Access Map</h1>", unsafe_allow_html=True)
+if "fetch_running" not in st.session_state:
+    st.session_state["fetch_running"] = False
 
-DATA_DIR = "data"
-SNAPSHOT_PATH = os.path.join(DATA_DIR, "iam_snapshot.json")
-DEMO_PATH = os.path.join(DATA_DIR, "sample_snapshot.json")
-
-# ensure data dir exists
-os.makedirs(DATA_DIR, exist_ok=True)
+if fetch_btn and auth_mode != "Demo" and not st.session_state["fetch_running"]:
+    st.session_state["fetch_running"] = True
+    with st.spinner("Fetching IAM data from AWS..."):
+        try:
+            fetch_iam_data(
+                session=session,
+                profile_name=(profile or None),
+                out_path=SNAPSHOT_PATH,
+                fast_mode=fast_mode,
+                force_fetch=force,
+                encrypt=encrypt,
+            )
+            st.sidebar.success("Snapshot saved.")
+        except Exception as e:
+            st.sidebar.error(f"Fetch failed: {e}")
+            st.stop()
+    st.session_state["fetch_running"] = False
+elif fetch_btn and auth_mode == "Demo":
+    st.sidebar.info("Demo mode: using sample snapshot (no AWS calls).")
 
 # ---- Load snapshot
-active_snapshot_path = DEMO_PATH if auth_mode == "Demo" else SNAPSHOT_PATH
 if not os.path.exists(active_snapshot_path):
     if auth_mode == "Demo":
         st.info("Demo mode selected but 'data/sample_snapshot.json' not found. Please add the file.")
@@ -1702,15 +1797,20 @@ except Exception as e:
     st.error(f"Failed to load snapshot: {e}")
     st.stop()
 
-# Sync with session state data if fetched
-if st.session_state.get("data"):
-    data = st.session_state["data"]
-
-# ---- Min-score filter
+# ---- Min-score filter (FIXED - no deepcopy)
 if min_score > 0:
-    data = deepcopy(data)
-    data["policies"] = [p for p in data.get("policies", []) if (p.get("RiskScore") or 0) >= min_score]
-    data["roles"] = [r for r in data.get("roles", []) if (r.get("AssumePolicyRiskScore") or 0) >= min_score]
+    # Shallow copy to avoid recursion - only copy lists we modify
+    data_copy = {
+        "_meta": data.get("_meta", {}),
+        "users": data.get("users", []),
+        "groups": data.get("groups", []),
+        "roles": data.get("roles", []),
+        "policies": data.get("policies", [])
+    }
+    # Filter without deep copy
+    data_copy["policies"] = [p for p in data_copy["policies"] if (p.get("RiskScore") or 0) >= min_score]
+    data_copy["roles"] = [r for r in data_copy["roles"] if (r.get("AssumePolicyRiskScore") or 0) >= min_score]
+    data = data_copy  # Use filtered copy
 
 # ---- Snapshot meta
 meta = data.get("_meta", {}) or {}
@@ -1792,20 +1892,27 @@ with col1:
             highlight_color=highlight_color,
             highlight_duration=highlight_duration
         )
-
+    
     with st.spinner("Building graph..."):
         try:
-            use_data = data
+            use_data = {
+                "_meta": data.get("_meta", {}),
+                "users": data.get("users", []),
+                "groups": data.get("groups", []),
+                "roles": data.get("roles", []),
+                "policies": data.get("policies", [])
+            }  # Shallow copy to avoid recursion
+
             if show_only_changes:
                 keep = compute_keep_set_from_diff(data)
                 if keep:
-                    filtered = deepcopy(data)
-                    filtered["users"] = [u for u in data.get("users", []) if u.get("UserName") in keep]
-                    filtered["groups"] = [g for g in data.get("groups", []) if g.get("GroupName") in keep]
-                    filtered["roles"] = [r for r in data.get("roles", []) if r.get("RoleName") in keep]
-                    filtered["policies"] = [p for p in data.get("policies", []) if p.get("PolicyName") in keep]
-                    filtered["_meta"] = deepcopy(data.get("_meta", {}))
-                    use_data = filtered
+                    use_data["users"] = [u for u in use_data["users"] if u.get("UserName") in keep]
+                    use_data["groups"] = [g for g in use_data["groups"] if g.get("GroupName") in keep]
+                    use_data["roles"] = [r for r in use_data["roles"] if r.get("RoleName") in keep]
+                    use_data["policies"] = [p for p in use_data["policies"] if p.get("PolicyName") in keep]
+
+            if show_only_risky:
+                use_data["policies"] = [p for p in use_data["policies"] if p.get("IsRisky")]
 
             G, html_str, clicked_node, export_data = cached_build_iam_graph(
                 use_data,
@@ -1814,7 +1921,6 @@ with col1:
                 highlight_color="orange",
                 highlight_duration=2500
             )
-
             # 🔎 Search results after G is ready
             if st.session_state.get("search_query"):
                 try:
@@ -1932,7 +2038,7 @@ with col2:
 
     st.markdown('<div class="detail-card">', unsafe_allow_html=True)
 
-    tab_overview, tab_json, tab_rels, tab_hints = st.tabs(["Overview", "Policy JSON", "Relationships", "Least-Privilege Hints"])
+    tab_overview, tab_json, tab_rels, tab_hints, tab_summary = st.tabs(["Overview", "Policy JSON", "Relationships", "Least-Privilege Hints", "Summary"])
 
     def _render_findings(findings):
         if not findings:
@@ -1956,6 +2062,40 @@ with col2:
 
         with tab_overview:
             st.markdown(f"### {etype.upper()} — {name}")
+            if iam_client:
+                try:
+                    if etype == "user":
+                        mfa_enabled = iam_client.get_user(UserName=name).get("User", {}).get("MFADevices", [])
+                        if not mfa_enabled:
+                            st.warning("MFA not enabled for this user")
+                    elif etype == "role":
+                        r = iam_client.get_role(RoleName=name).get("Role", {})
+                        assume_doc = r.get("AssumeRolePolicyDocument", {})
+                        if isinstance(assume_doc, str):
+                            assume_doc = json.loads(urllib.parse.unquote(assume_doc))
+                        has_mfa_condition = any(
+                            stmt.get("Condition", {}).get("Bool", {}).get("aws:MultiFactorAuthPresent") == "true"
+                            for stmt in _ensure_list(assume_doc.get("Statement", []))
+                        )
+                        if not has_mfa_condition:
+                            st.warning("No MFA condition in assume role policy for this role")
+                    elif etype == "group":
+                        g = iam_client.get_group(GroupName=name).get("Group", {})
+                        users = g.get("Users", [])
+                        mfa_missing = []
+                        for user in users:
+                            uname = user.get("UserName")
+                            user_mfa = iam_client.get_user(UserName=uname).get("User", {}).get("MFADevices", [])
+                            if not user_mfa:
+                                mfa_missing.append(uname)
+                        if mfa_missing:
+                            st.warning(f"MFA not enabled for users in group: {', '.join(mfa_missing)}")
+                    # No MFA for policy – skip
+                except ClientError as e:
+                    st.error(f"AWS API error: {e.response['Error']['Message']}")
+                except Exception as e:
+                    st.error(f"Unexpected error checking MFA: {e}")
+
             if etype == "policy":
                 p = next((x for x in data.get("policies", []) if x.get("PolicyName") == name), None)
                 if p:
@@ -1963,10 +2103,6 @@ with col2:
                     st.write("IsRisky:", p.get("IsRisky"))
                     st.write("RiskActions:", p.get("RiskActions"))
                     st.write("Arn:", p.get("Arn"))
-                    if iam_client:
-                        mfa_enabled = iam_client.get_user(UserName=name).get("User", {}).get("MFADevices", [])
-                        if not mfa_enabled:
-                            st.warning("MFA not enabled for this entity")
                     # Service Last Used
                     slu = p.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
@@ -1993,10 +2129,6 @@ with col2:
                     st.write("AssumePolicyRisk:", r.get("AssumePolicyRisk"))
                     st.write("AttachedPolicies:", [a.get("PolicyName") for a in (r.get("AttachedPolicies") or [])])
                     st.write("Arn:", r.get("Arn"))
-                    if iam_client:
-                        mfa_enabled = iam_client.get_role(RoleName=name).get("Role", {}).get("MFAEnabled", False)
-                        if not mfa_enabled:
-                            st.warning("MFA not enabled for this role")
                     # Service Last Used
                     slu = r.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
@@ -2022,10 +2154,6 @@ with col2:
                     st.write("Arn:", u.get("Arn"))
                     st.write("Groups:", u.get("Groups", []))
                     st.write("AttachedPolicies:", [a.get("PolicyName") for a in (u.get("AttachedPolicies") or [])])
-                    if iam_client:
-                        mfa_enabled = iam_client.get_user(UserName=name).get("User", {}).get("MFADevices", [])
-                        if not mfa_enabled:
-                            st.warning("MFA not enabled for this user")
                     # Service Last Used
                     slu = u.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
@@ -2049,10 +2177,6 @@ with col2:
                 g = next((x for x in data.get("groups", []) if x.get("GroupName") == name), None)
                 if g:
                     st.write("AttachedPolicies:", [a.get("PolicyName") for a in (g.get("AttachedPolicies") or [])])
-                    if iam_client:
-                        mfa_enabled = any(iam_client.get_user(UserName=un).get("User", {}).get("MFADevices", []) for un in g.get("Users", []))
-                        if not mfa_enabled:
-                            st.warning("MFA not enabled for any user in this group")
                     # Service Last Used
                     slu = g.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
@@ -2115,19 +2239,11 @@ with col2:
                     services = slu.get("services", [])
                     if services:
                         st.subheader("Service Last Used")
-                        table_data = []
-                        for s in services:
-                            last = s.get("lastAuthenticated")
-                            action = ""
-                            if last:
-                                last_dt = dt.fromisoformat(last.replace("Z", "+00:00"))
-                                days_old = (dt.utcnow() - last_dt).days
-                                action = "Remove" if days_old > 90 else "Monitor"
-                            table_data.append({"Service": s.get("serviceNamespace"), "Last Accessed": last, "Suggested Action": action})
+                        table_data = [{"Service": s.get("serviceNamespace"), "Last Accessed": s.get("lastAuthenticated"), "Suggested Action": 
+                                      "Remove" if s.get("lastAuthenticated") and (dt.utcnow() - dt.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90 else "Monitor"} 
+                                      for s in services]
                         st.table(table_data)
-                        # Cross-check policy actions vs used (simple example)
-                        policy_actions = [stmt.get("Action", []) for stmt in p.get("Document", {}).get("Statement", [])]
-                        policy_actions = [a for sublist in policy_actions for a in (sublist if isinstance(sublist, list) else [sublist])]
+                        policy_actions = [a for stmt in p.get("Document", {}).get("Statement", []) for a in (stmt.get("Action", []) if isinstance(stmt.get("Action"), list) else [stmt.get("Action")])]
                         used_services = [s.get("serviceNamespace") for s in services]
                         unused_actions = [act for act in policy_actions if act and act.split(":")[0] not in used_services]
                         if unused_actions:
@@ -2154,20 +2270,12 @@ with col2:
                     services = slu.get("services", [])
                     if services:
                         st.subheader("Service Last Used")
-                        table_data = []
-                        for s in services:
-                            last = s.get("lastAuthenticated")
-                            action = ""
-                            if last:
-                                last_dt = dt.fromisoformat(last.replace("Z", "+00:00"))
-                                days_old = (dt.utcnow() - last_dt).days
-                                action = "Remove" if days_old > 90 else "Monitor"
-                            table_data.append({"Service": s.get("serviceNamespace"), "Last Accessed": last, "Suggested Action": action})
+                        table_data = [{"Service": s.get("serviceNamespace"), "Last Accessed": s.get("lastAuthenticated"), "Suggested Action": 
+                                      "Remove" if s.get("lastAuthenticated") and (dt.utcnow() - dt.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90 else "Monitor"} 
+                                      for s in services]
                         st.table(table_data)
-                        # Cross-check (example)
                         attached_pols = [next((x for x in data.get("policies", []) if x.get("PolicyName") == a.get("PolicyName")), {}) for a in r.get("AttachedPolicies", [])]
-                        policy_actions = [stmt.get("Action", []) for pol in attached_pols for stmt in pol.get("Document", {}).get("Statement", [])]
-                        policy_actions = [a for sublist in policy_actions for a in (sublist if isinstance(sublist, list) else [sublist])]
+                        policy_actions = [a for pol in attached_pols for stmt in pol.get("Document", {}).get("Statement", []) for a in (stmt.get("Action", []) if isinstance(stmt.get("Action"), list) else [stmt.get("Action")])]
                         used_services = [s.get("serviceNamespace") for s in services]
                         unused_actions = [act for act in policy_actions if act and act.split(":")[0] not in used_services]
                         if unused_actions:
@@ -2178,40 +2286,29 @@ with col2:
                 u = next((x for x in data.get("users", []) if x.get("UserName") == name), None)
                 if u:
                     st.subheader("Attached customer-managed policies")
-                    for ap in (u.get("AttachedPolicies") or []):
+                    for ap in u.get("AttachedPolicies") or []:
                         pname = ap.get("PolicyName")
                         pol = next((x for x in data.get("policies", []) if x.get("PolicyName") == pname), None)
                         if pol:
                             st.markdown(f"**Policy:** {pname}")
                             _render_findings(pol.get("Findings") or [])
-
-                    inline_prefix = f"{name}::INLINE::"
+                    inline_prefix = f"{selected['name']}::INLINE::"
                     inlines = [p for p in data.get("policies", []) if p.get("PolicyName", "").startswith(inline_prefix)]
                     if inlines:
                         st.subheader("Inline policies")
                         for pol in inlines:
                             st.markdown(f"**Policy:** {pol.get('PolicyName')}")
                             _render_findings(pol.get("Findings") or [])
-
-                    # usage-based hints
                     slu = u.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
                     if services:
                         st.subheader("Service Last Used")
-                        table_data = []
-                        for s in services:
-                            last = s.get("lastAuthenticated")
-                            action = ""
-                            if last:
-                                last_dt = dt.fromisoformat(last.replace("Z", "+00:00"))
-                                days_old = (dt.utcnow() - last_dt).days
-                                action = "Remove" if days_old > 90 else "Monitor"
-                            table_data.append({"Service": s.get("serviceNamespace"), "Last Accessed": last, "Suggested Action": action})
+                        table_data = [{"Service": s.get("serviceNamespace"), "Last Accessed": s.get("lastAuthenticated"), "Suggested Action": 
+                                      "Remove" if s.get("lastAuthenticated") and (dt.utcnow() - dt.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90 else "Monitor"} 
+                                      for s in services]
                         st.table(table_data)
-                        # Cross-check
                         attached_pols = [next((x for x in data.get("policies", []) if x.get("PolicyName") == a.get("PolicyName")), {}) for a in u.get("AttachedPolicies", [])]
-                        policy_actions = [stmt.get("Action", []) for pol in attached_pols for stmt in pol.get("Document", {}).get("Statement", [])]
-                        policy_actions = [a for sublist in policy_actions for a in (sublist if isinstance(sublist, list) else [sublist])]
+                        policy_actions = [a for pol in attached_pols for stmt in pol.get("Document", {}).get("Statement", []) for a in (stmt.get("Action", []) if isinstance(stmt.get("Action"), list) else [stmt.get("Action")])]
                         used_services = [s.get("serviceNamespace") for s in services]
                         unused_actions = [act for act in policy_actions if act and act.split(":")[0] not in used_services]
                         if unused_actions:
@@ -2221,23 +2318,33 @@ with col2:
             elif etype == "group":
                 g = next((x for x in data.get("groups", []) if x.get("GroupName") == name), None)
                 if g:
-                    # usage-based hints
                     slu = g.get("ServiceLastUsed", {})
                     services = slu.get("services", [])
                     if services:
                         st.subheader("Service Last Used")
-                        table_data = []
-                        for s in services:
-                            last = s.get("lastAuthenticated")
-                            action = ""
-                            if last:
-                                last_dt = dt.fromisoformat(last.replace("Z", "+00:00"))
-                                days_old = (dt.utcnow() - last_dt).days
-                                action = "Remove" if days_old > 90 else "Monitor"
-                            table_data.append({"Service": s.get("serviceNamespace"), "Last Accessed": last, "Suggested Action": action})
+                        table_data = [{"Service": s.get("serviceNamespace"), "Last Accessed": s.get("lastAuthenticated"), "Suggested Action": 
+                                      "Remove" if s.get("lastAuthenticated") and (dt.utcnow() - dt.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90 else "Monitor"} 
+                                      for s in services]
                         st.table(table_data)
                     else:
                         st.info("No usage data (enable CloudTrail).")
+        with tab_summary:
+            entity = next((x for x in data.get(selected["type"] + "s", []) if x.get(f"{selected['type'].capitalize()}Name") == selected["name"]), None)
+            if entity:
+                st.markdown("### Summary")
+                st.metric("Risk Score", entity.get("RiskScore", 0) if selected["type"] == "policy" else entity.get("AssumePolicyRiskScore", 0))
+                if st.button("Remediate"):
+                    st.write(f"Run: aws iam delete-{selected['type']} --{selected['type']}-name {selected['name']}")  # Placeholder
+                slu = entity.get("ServiceLastUsed", {})
+                services = slu.get("services", [])
+                if services:
+                    st.write(f"Last Used: {services[0].get('lastAuthenticated')}")
+                else:
+                    st.write("Last Used: N/A")
+                unused_actions = [act for stmt in entity.get("Document", {}).get("Statement", []) for act in (stmt.get("Action", []) if isinstance(stmt.get("Action"), list) else [stmt.get("Action")]) 
+                                 if act and act.split(":")[0] not in [s.get("serviceNamespace") for s in services]]
+                if unused_actions:
+                    st.warning(f"Unused Actions: {', '.join(unused_actions)}")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
