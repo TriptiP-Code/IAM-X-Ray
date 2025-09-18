@@ -49,3 +49,5 @@ htmlcov/
 build/
 dist/
 *.egg
+
+!data/.gitkeep  # Allow empty file to track data/ dir if you want
