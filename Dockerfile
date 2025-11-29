@@ -3,26 +3,34 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-RUN apt-get update && apt-get install -y \
+# install build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN groupadd -r app && useradd -r -g app app
-RUN mkdir -p /app/data && chown -R app:app /app
+# create non-root user early so files can be owned by them
+RUN groupadd -r app && useradd -r -g app -m -d /home/app app
 
-COPY requirements.txt .
-USER app
-RUN pip install --no-cache-dir -r requirements.txt
+# copy requirements + install as root (pip cache can be shared)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# copy app and set ownership to non-root user
 COPY . /app
+RUN chown -R app:app /app
+
+USER app
+WORKDIR /app
 
 EXPOSE 8501
 
+# Use query param health check (streamlit doesn't expose /healthz)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8501/healthz || exit 1
+  CMD curl -fsS "http://localhost:8501/?healthz=1" || exit 1
 
 CMD ["streamlit", "run", "app/main.py", \
      "--server.port=8501", \

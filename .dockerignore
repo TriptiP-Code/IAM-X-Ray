@@ -1,11 +1,38 @@
-data/
-venv/
+# Runtime data (will be recreated inside container)
+data/*
+!data/sample_snapshot.json
+!data/.gitkeep
+reset_backups/
+snapshots/
+
+# Secrets
+.env
+*.env
+secrets.toml
+auth.json
+setup.lock
+iamxray_remember.json
+
+# Python cache
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
 .eggs/
+
+# Virtual env
+venv/
+.venv/
+
+# Streamlit cache
+.streamlit/
+
+# Logs / temp
 *.log
-.env
-secrets.toml
+*.tmp
+*.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

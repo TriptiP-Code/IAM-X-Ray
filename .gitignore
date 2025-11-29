@@ -1,53 +1,81 @@
+# -----------------------------
 # Python
+# -----------------------------
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*.pyo
+*.so
+*.egg
 *.egg-info/
 .eggs/
+
+# Logs
 *.log
 
-# Virtual environments
+# -----------------------------
+# Virtual Environments
+# -----------------------------
 venv/
-.env/
 .venv/
+env/
+ENV/
 
-# Streamlit cache
-.streamlit/
+# -----------------------------
+# Data (runtime), keep only demo sample
+# -----------------------------
+data/*
+!data/sample_snapshot.json
+!data/.gitkeep
 
-# Local data & secrets
-data/
-*.db
-*.sqlite
+reset_backups/
+snapshots/
+
+# -----------------------------
+# Credentials / Secrets
+# -----------------------------
+.env
+*.env
+secrets.toml
 auth.json
 setup.lock
+iamxray_remember.json
 
-# Config / Secrets
-.env
-secrets.toml
+# -----------------------------
+# Streamlit
+# -----------------------------
+.streamlit/
 
+# -----------------------------
 # Docker
+Dockerfile~
 *.pid
 *.sock
 *.tmp
 
-# OS
+# -----------------------------
+# OS / Editor / Temp
+# -----------------------------
 .DS_Store
 Thumbs.db
-
-# IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
+*.bak
+*.tmp
 
+# -----------------------------
 # Testing
+# -----------------------------
 .pytest_cache/
-.coverage
+cover/
 htmlcov/
+.coverage*
 
-# Build
+# -----------------------------
+# Build Artifacts
+# -----------------------------
 build/
 dist/
 *.egg
-
-!data/.gitkeep  # Allow empty file to track data/ dir if you want
+*.whl

@@ -1,170 +1,148 @@
-# import networkx as nx
-# from pyvis.network import Network
-# import tempfile
+# # core/graph_builder.py
+# """
+# Safe, trimmed IAM graph builder for IAM X-Ray v0.1.0-beta.
+
+# - Filters AWS-managed policies & service-linked roles early to avoid explosion.
+# - Caps default graph size via MAX_NODES and preserves changed/risky nodes from snapshot diff.
+# - Lightweight policy analysis for risk-highlighting.
+# - Maintains compatibility with previous API:
+#     build_graph(snapshot, show_only_risky=False) -> networkx.DiGraph
+#     build_iam_graph(snapshot, ...) -> (G, html_str, clicked_node, export_bytes)
+#     search_permissions(G, query) -> dict
+# """
 # import os
-# import logging
 # import re
 # import json
-# import difflib
+# import tempfile
+# import logging
 # from datetime import datetime, timedelta
 
-# from core import secure_store   # 🔑 new import for encrypted snapshot support
+# import networkx as nx
+# from pyvis.network import Network
 
+# # Try to import secure_store (some versions provide decrypt_and_read)
+# from core import secure_store
+
+# logger = logging.getLogger("graph_builder")
+# logger.setLevel(logging.INFO)
+# if not logger.handlers:
+#     ch = logging.StreamHandler()
+#     ch.setLevel(logging.INFO)
+#     logger.addHandler(ch)
+
+# # Colors used in UI
 # NODE_COLORS = {
-#     "user": "#3B82F6",     # Blue
-#     "group": "#F59E0B",    # Orange
-#     "role": "#10B981",     # Green
-#     "policy": "#6B7280",   # Gray
-#     "principal": "#9CA3AF" # Light Gray
+#     "user": "#3B82F6",
+#     "group": "#F59E0B",
+#     "role": "#10B981",
+#     "policy": "#6B7280",
+#     "principal": "#9CA3AF",
 # }
 
-# # ================== NEW HELPERS ==================
+# # Safety limits for beta
+# MAX_NODES = 200            # target cap for interactive graph
+# CLUSTER_THRESHOLD = 600    # not used aggressively in beta
 
-# def load_snapshot(path):
-#     """
-#     Load IAM snapshot - supports both encrypted and plaintext.
-#     """
-#     try:
-#         return secure_store.read_and_decrypt(path)
-#     except Exception:
-#         with open(path, "r", encoding="utf-8") as f:
-#             return json.load(f)
+# # AWS-managed/service-linked detection
+# AWS_MANAGED_PREFIX = "arn:aws:iam::aws:policy/"
+# AWS_SERVICE_ROLE_PATTERNS = [r"AWSServiceRoleFor", r"^aws-service-role/"]
+# AWS_DEFAULT_ROLE_NAMES = ["OrganizationAccountAccessRole"]
 
+# # Risk patterns for light analyzer
 # RISKY_PATTERNS = [
 #     r"\*",
 #     r"iam:PassRole",
 #     r"sts:AssumeRole",
-#     r"s3:\*",
-#     r"kms:\*",
-#     r"ec2:\*",
 # ]
 
-# def analyze_policy_document(doc):
+
+# def load_snapshot(path):
 #     """
-#     Scan a policy document and return risky findings (actions with wildcards or sensitive services).
+#     Load IAM snapshot - supports encrypted (.enc) and plaintext (.json).
+#     Tries secure_store.decrypt_and_read or secure_store.read_and_decrypt if present.
+#     """
+#     if not path or not os.path.exists(path):
+#         raise FileNotFoundError(f"Snapshot not found: {path}")
+#     # prefer secure_store.decrypt_and_read
+#     try:
+#         if hasattr(secure_store, "decrypt_and_read"):
+#             return secure_store.decrypt_and_read(path)
+#         if hasattr(secure_store, "read_and_decrypt"):
+#             return secure_store.read_and_decrypt(path)
+#     except Exception as e:
+#         logger.debug(f"secure_store decrypt/read failed: {e}. Trying plaintext fallback.")
+
+#     # plaintext fallback
+#     with open(path, "r", encoding="utf-8") as f:
+#         return json.load(f)
+
+
+# # ------------------- Lightweight policy analyzer ---------------------
+# def _ensure_list(x):
+#     if x is None:
+#         return []
+#     if isinstance(x, list):
+#         return x
+#     return [x]
+
+
+# def _lightweight_policy_findings(doc):
+#     """
+#     Minimal, fast checks:
+#       - action/resource wildcard
+#       - iam:PassRole, sts:AssumeRole
+#     Returns list of finding dicts.
 #     """
 #     findings = []
 #     if not isinstance(doc, dict):
 #         return findings
-
 #     stmts = doc.get("Statement", [])
 #     if isinstance(stmts, dict):
 #         stmts = [stmts]
-
-#     for stmt in stmts:
-#         actions = stmt.get("Action") or stmt.get("NotAction")
-#         if not actions:
-#             continue
-#         if isinstance(actions, str):
-#             actions = [actions]
-#         for act in actions:
-#             for pat in RISKY_PATTERNS:
-#                 if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
-#                     findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
+#     for idx, stmt in enumerate(stmts):
+#         actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#         resources = _ensure_list(stmt.get("Resource"))
+#         for a in actions:
+#             if not isinstance(a, str):
+#                 continue
+#             al = a.lower()
+#             if al == "*" or "*" in al:
+#                 findings.append({"code": "ACTION_WILDCARD", "message": f"Action wildcard: {a}"})
+#             if al in ("iam:passrole", "sts:assumerole"):
+#                 findings.append({"code": "SENSITIVE_ACTION", "message": f"Sensitive action: {a}"})
+#         for r in resources:
+#             if isinstance(r, str) and r.strip() == "*":
+#                 findings.append({"code": "RESOURCE_WILDCARD", "message": "Resource '*' used"})
 #     return findings
 
 
-# def search_permissions(G, query):
-#     """
-#     Search who can perform a given action, or what a given entity can do.
-#     - If query looks like 'service:Action', return entities allowed.
-#     - If query matches a node name, return its permissions.
-#     - If no exact match, suggest close matches.
-#     """
-#     results = {}
-#     if not query:
-#         return results
+# # ------------------- Helpers to detect AWS-managed/service roles ---------------------
+# def _is_aws_managed_policy(p):
+#     arn = (p or {}).get("Arn") or ""
+#     name = (p or {}).get("PolicyName") or ""
+#     if isinstance(arn, str) and arn.startswith(AWS_MANAGED_PREFIX):
+#         return True
+#     # also catch obvious patterns
+#     if isinstance(name, str) and (name.startswith("AWS") or "Amazon" in name):
+#         # conservative: only skip if clearly AWS-managed naming
+#         if "Managed" in name or "AWS" in name:
+#             return True
+#     return False
 
-#     query_low = query.lower()
-#     is_regex = query.startswith("/")
-#     if is_regex:
-#         query = query[1:]
-#         query_low = query_low[1:]
-#         try:
-#             regex_pat = re.compile(query, re.IGNORECASE)
-#         except re.error:
-#             return {"error": "Invalid regex pattern"}
 
-#     # Case 1: Action search (e.g., s3:PutObject)
-#     if ":" in query_low:
-#         matches = []
-#         for n, attrs in G.nodes(data=True):
-#             if attrs.get("type") == "policy":
-#                 doc = (attrs.get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     for f in findings:
-#                         act_low = f["action"].lower()
-#                         if (not is_regex and query_low == act_low) or (is_regex and regex_pat.search(act_low)):
-#                             matches.append(n)
-#         # Deep traversal: Find who has access via attached policies
-#         who_can_do = set()
-#         for m in matches:
-#             who_can_do.update(G.predecessors(m))
-#         results["action_search"] = {query: matches}
-#         results["who_can_do"] = list(who_can_do)
-#         return results
+# def _is_service_linked_role(r):
+#     name = (r or {}).get("RoleName") or ""
+#     if not name:
+#         return False
+#     for pat in AWS_SERVICE_ROLE_PATTERNS:
+#         if re.search(pat, name, flags=re.IGNORECASE):
+#             return True
+#     if name in AWS_DEFAULT_ROLE_NAMES:
+#         return True
+#     return False
 
-#     # Case 2: Entity search
-#     target_node = None
-#     for node in G.nodes:
-#         if node.lower() == query_low:
-#             target_node = node
-#             break
 
-#     if target_node and target_node in G.nodes:
-#         attrs = G.nodes[target_node]
-#         node_type = attrs.get("type")
-#         if node_type == "policy":
-#             doc = (attrs.get("meta") or {}).get("Document")
-#             if doc:
-#                 findings = analyze_policy_document(doc)
-#                 results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
-#         else:
-#             # For user/group/role/principal: find attached/outgoing policies and their findings
-#             attached_policies = [succ for succ in G.successors(target_node) if G.nodes[succ].get("type") == "policy"]
-#             entity_findings = {}
-#             for pname in attached_policies:
-#                 doc = (G.nodes[pname].get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
-#             results["entity"] = dict(attrs)
-#             results["entity_attached_findings"] = entity_findings
-#     else:
-#         # No exact node → suggest fuzzy matches
-#         close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
-#         if close_matches:
-#             results["fuzzy_matches"] = close_matches
-
-#     return results
-
-# # ================== EXISTING HELPERS (untouched) ==================
-
-# def _node_label(name, kind, risky=False, score=0):
-#     prefix = {
-#         "user": "👤 ",
-#         "group": "👥 ",
-#         "role": "🎭 ",
-#         "policy": "📜 ",
-#         "principal": "🔑 "
-#     }.get(kind, "")
-#     label = f"{prefix}{name}"
-#     if risky:
-#         label = f"🔥 {label}"
-#     if score and score > 0:
-#         label = f"{label} ({score})"
-#     return label
-
-# def _risk_color(score):
-#     if score is None:
-#         score = 0
-#     score = max(0, min(score, 10))
-#     r = int((score / 10) * 255)
-#     g = int(((10 - score) / 10) * 200)
-#     b = 60
-#     return f"rgb({r},{g},{b})"
-
+# # ------------------- Diff-based keep set ---------------------
 # def compute_keep_set_from_diff(snapshot):
 #     """Return set of entity names that are added/modified (for all entity types)."""
 #     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
@@ -177,8 +155,10 @@
 #                 keep.add(n)
 #     return keep
 
+
+# # ------------------- Build adjacency helper ---------------------
 # def build_adjacency(G):
-#     """Return {node: {incoming: [...], outgoing: [...]}}."""
+#     """Return {node: {incoming: [...], outgoing: [...]}} for a networkx graph."""
 #     adj = {}
 #     for n in G.nodes:
 #         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
@@ -186,2384 +166,2155 @@
 #         adj[n] = {"incoming": incoming, "outgoing": outgoing}
 #     return adj
 
+
 # def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
+#     """Export a compact nodes/edges JSON for download/debug."""
 #     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
+#         "nodes": [{"id": n, **dict(G.nodes[n])} for n in G.nodes()],
+#         "edges": [{"source": u, "target": v, **(dict(e) if isinstance(e, dict) else {})} for u, v, e in G.edges(data=True)]
 #     }
 #     with open(path, "w", encoding="utf-8") as f:
 #         json.dump(data, f, indent=2)
 #     return path
 
 
+# # ------------------- Build trimmed graph (core fix) ---------------------
 # def build_graph(snapshot, show_only_risky=False):
 #     """
-#     Pure graph builder (no HTML). Returns a NetworkX.DiGraph.
-#     Mirrors build_iam_graph's node/edge logic.
+#     Build a networkx DiGraph from snapshot with safety trimming:
+#       - Filter out AWS-managed policies and service-linked roles early.
+#       - Cap node count to MAX_NODES preserving changed/risky nodes if possible.
+#     Returns: nx.DiGraph
 #     """
-#     G = nx.DiGraph()
+#     if not snapshot or not any(k in snapshot for k in ("users", "groups", "roles", "policies")):
+#         logger.warning("Invalid or empty snapshot data")
+#         return nx.DiGraph()
 
-#     # Users
-#     for u in snapshot.get("users", []):
-#         name = u.get("UserName")
-#         if name:
-#             risky = bool(u.get("IsRisky"))
-#             G.add_node(name, type="user", risky=risky, meta=u)
+#     # -- Pre-filter lists to remove heavy AWS-managed/service items --
+#     users = snapshot.get("users", []) or []
+#     groups = snapshot.get("groups", []) or []
+#     roles = snapshot.get("roles", []) or []
+#     policies = snapshot.get("policies", []) or []
 
-#     # Groups
-#     for g in snapshot.get("groups", []):
-#         gname = g.get("GroupName")
-#         if not gname:
+#     filtered_policies = []
+#     for p in policies:
+#         try:
+#             if _is_aws_managed_policy(p):
+#                 continue
+#         except Exception:
+#             # if detection fails, keep policy to be safe
+#             filtered_policies.append(p)
 #             continue
-#         risky = bool(g.get("IsRisky"))
-#         G.add_node(gname, type="group", risky=risky, meta=g)
+#         filtered_policies.append(p)
 
-#         for ap in g.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(gname, pname, relation="attached")
+#     filtered_roles = []
+#     for r in roles:
+#         try:
+#             if _is_service_linked_role(r):
+#                 continue
+#         except Exception:
+#             filtered_roles.append(r)
+#             continue
+#         filtered_roles.append(r)
 
-#     # Roles
-#     for r in snapshot.get("roles", []):
-#         rname = r.get("RoleName")
+#     # Quick counts
+#     total_entities = len(users) + len(groups) + len(filtered_roles) + len(filtered_policies)
+#     logger.info(f"Entities after AWS-managed/service-role filtering: users={len(users)}, groups={len(groups)}, roles={len(filtered_roles)}, policies={len(filtered_policies)} (total={total_entities})")
+
+#     # Decide keep set based on diff (prefer changed/risky)
+#     keep_set = compute_keep_set_from_diff(snapshot)
+
+#     # Build an ordered list of nodes (prefer keep_set and risky ones)
+#     # We'll create a set of node ids to include (strings: user names, group names, role names, policy names)
+#     node_candidates = []
+
+#     def add_candidate(name, t, score=0, risky=False):
+#         node_candidates.append({"id": name, "type": t, "score": score, "risky": risky})
+
+#     for p in filtered_policies:
+#         pname = p.get("PolicyName") or p.get("Arn")
+#         if not pname:
+#             continue
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_candidate(pname, "policy", score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     for r in filtered_roles:
+#         rname = r.get("RoleName") or r.get("Arn")
 #         if not rname:
 #             continue
-#         role_risk = bool(r.get("AssumePolicyRisk"))
-#         role_score = r.get("AssumePolicyRiskScore") or 0
-#         G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
+#         role_risk = bool(r.get("AssumePolicyRisk")) or bool(r.get("AssumePolicyFindings"))
+#         add_candidate(rname, "role", score=r.get("AssumePolicyRiskScore") or 0, risky=role_risk)
 
-#         for ap in r.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(rname, pname, relation="attached")
+#     for g in groups:
+#         gname = g.get("GroupName")
+#         if gname:
+#             add_candidate(gname, "group", risky=bool(g.get("IsRisky")))
 
-#         for pr in r.get("PrincipalsInfo") or []:
-#             short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
-#             node_name = f"PRINC:{short}"
-#             if not G.has_node(node_name):
-#                 G.add_node(
-#                     node_name, type="principal", risky=False,
-#                     meta={"principal": pr.get("value"), "principal_type": pr.get("type")}
-#                 )
-#             G.add_edge(node_name, rname, relation="assumes")
-
-#     # Policies
-#     for p in snapshot.get("policies", []):
-#         pname = p.get("PolicyName")
-#         if pname:
-#             is_risky = bool(p.get("IsRisky"))
-#             score = p.get("RiskScore") or 0
-#             G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
-
-#     # User → group/policy edges
-#     for u in snapshot.get("users", []):
+#     for u in users:
 #         uname = u.get("UserName")
-#         for gname in u.get("Groups", []) or []:
-#             if G.has_node(gname):
-#                 G.add_edge(uname, gname, relation="member")
-#         for ap in u.get("AttachedPolicies", []) or []:
+#         if uname:
+#             add_candidate(uname, "user", risky=bool(u.get("IsRisky")))
+
+#     # Sort candidates: keep ones from keep_set and risky first, then by score desc
+#     def candidate_sort_key(c):
+#         return (
+#             0 if c["id"] in keep_set else 1,
+#             0 if c["risky"] else 1,
+#             -int(c.get("score") or 0)
+#         )
+
+#     node_candidates_sorted = sorted(node_candidates, key=candidate_sort_key)
+
+#     # Trim to MAX_NODES
+#     chosen = node_candidates_sorted[:MAX_NODES]
+#     chosen_ids = {c["id"] for c in chosen}
+#     logger.info(f"Selected {len(chosen)} nodes (MAX_NODES={MAX_NODES}) for graph")
+
+#     # Build graph only from chosen nodes
+#     G = nx.DiGraph()
+
+#     # Add nodes (with meta) for chosen set
+#     # Helper to add node if in chosen_ids
+#     def add_node_if_chosen(id_name, kind, meta=None, risk_score=0, risky=False):
+#         if id_name in chosen_ids and not G.has_node(id_name):
+#             attrs = {"type": kind, "meta": meta or {}, "risk_score": risk_score, "risky": bool(risky)}
+#             G.add_node(id_name, **attrs)
+
+#     # Add policy nodes
+#     policy_map = { (p.get("PolicyName") or p.get("Arn")): p for p in filtered_policies if (p.get("PolicyName") or p.get("Arn")) }
+#     for pname, p in policy_map.items():
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_node_if_chosen(pname, "policy", meta=p, risk_score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     # Add role nodes and attachments
+#     role_map = { (r.get("RoleName") or r.get("Arn")): r for r in filtered_roles if (r.get("RoleName") or r.get("Arn")) }
+#     for rname, r in role_map.items():
+#         add_node_if_chosen(rname, "role", meta=r, risk_score=r.get("AssumePolicyRiskScore") or 0, risky=bool(r.get("AssumePolicyRisk")))
+#         for ap in (r.get("AttachedPolicies") or []):
 #             pname = ap.get("PolicyName")
 #             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(uname, pname, relation="attached")
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(pname) and G.has_node(rname):
+#                     G.add_edge(rname, pname, relation="attached")
+#         for pr in (r.get("PrincipalsInfo") or []):
+#             short = (pr.get("value") or "").split("/")[-1]
+#             node_name = f"PRINC:{short}"
+#             add_node_if_chosen(node_name, "principal", meta=pr)
+#             if G.has_node(node_name) and G.has_node(rname):
+#                 G.add_edge(node_name, rname, relation="assumes")
 
-#     # Risky-only filter
+#     # Add groups and their attached policies
+#     group_map = { g.get("GroupName"): g for g in groups if g.get("GroupName") }
+#     for gname, g in group_map.items():
+#         add_node_if_chosen(gname, "group", meta=g, risky=bool(g.get("IsRisky")))
+#         for ap in (g.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(gname) and G.has_node(pname):
+#                     G.add_edge(gname, pname, relation="attached")
+
+#     # Add users, membership and attached policies
+#     user_map = { u.get("UserName"): u for u in users if u.get("UserName") }
+#     for uname, u in user_map.items():
+#         add_node_if_chosen(uname, "user", meta=u, risky=bool(u.get("IsRisky")))
+#         for gname in (u.get("Groups") or []):
+#             if G.has_node(uname) and G.has_node(gname):
+#                 G.add_edge(uname, gname, relation="member")
+#         for ap in (u.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(uname) and G.has_node(pname):
+#                     G.add_edge(uname, pname, relation="attached")
+
+#     # If show_only_risky option set, filter G down
 #     if show_only_risky:
-#         risky_nodes = {n for n, a in G.nodes(data=True) if a.get("risky")}
-#         neighbors = set()
-#         for rn in risky_nodes:
-#             neighbors.update(G.predecessors(rn))
-#             neighbors.update(G.successors(rn))
-#         keep = risky_nodes.union(neighbors)
-#         return G.subgraph(keep).copy()
+#         risky_nodes = [n for n, a in G.nodes(data=True) if a.get("risky")]
+#         H = G.subgraph(risky_nodes).copy()
+#         return H
 
 #     return G
 
-# # ---------- UI graph builder (PyVis HTML) ----------
-# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
-#                     highlight_color="#ffeb3b", highlight_duration=2200):
-#     """
-#     Build IAM graph.
-#     Returns: (G, html_str, clicked_node)
-#     """
-#     # build pure graph first
-#     G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-#     G = G_full  # alias expected by callers
 
-#     # === PyVis Graph ===
-#     net = Network(height="760px", width="100%", notebook=False, directed=True)
+# # ------------------- Search (keeps compatibility with previous API) ---------------------
+# import difflib
+# def search_permissions(G, query):
+#     """
+#     Search who can perform a given action (lightweight), or return attached findings for an entity.
+#     Works with networkx DiGraph created by build_graph.
+#     """
+#     results = {}
+#     if not query:
+#         return results
+#     q_low = query.lower()
+#     is_regex = q_low.startswith("/")
+#     regex_pat = None
+#     if is_regex:
+#         try:
+#             regex_pat = re.compile(query[1:], re.IGNORECASE)
+#         except re.error:
+#             return {"error": "Invalid regex"}
+
+#     # If it looks like an action (contains ':') scan policy nodes
+#     if ":" in q_low:
+#         matches = []
+#         for n, attrs in G.nodes(data=True):
+#             if attrs.get("type") == "policy":
+#                 doc = (attrs.get("meta") or {}).get("Document") or {}
+#                 findings = _lightweight_policy_findings(doc)
+#                 for f in findings:
+#                     msg = f.get("message", "").lower()
+#                     if (not is_regex and q_low in msg) or (is_regex and regex_pat.search(msg)):
+#                         matches.append(n)
+#                         break
+#         who_can_do = set()
+#         for m in matches:
+#             # predecessors are entities that reference the policy
+#             if hasattr(G, "predecessors"):
+#                 try:
+#                     who_can_do.update(list(G.predecessors(m)))
+#                 except Exception:
+#                     pass
+#         results["action_search"] = {query: matches}
+#         results["who_can_do"] = list(who_can_do)
+#         return results
+
+#     # Entity search
+#     # exact match
+#     target = None
+#     for n in G.nodes:
+#         if n.lower() == q_low:
+#             target = n
+#             break
+#     if target:
+#         attrs = G.nodes[target]
+#         if attrs.get("type") == "policy":
+#             doc = (attrs.get("meta") or {}).get("Document") or {}
+#             findings = _lightweight_policy_findings(doc)
+#             results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
+#         else:
+#             attached = [s for s in G.successors(target) if G.nodes[s].get("type") == "policy"]
+#             entity_findings = {}
+#             for p in attached:
+#                 doc = (G.nodes[p].get("meta") or {}).get("Document") or {}
+#                 entity_findings[p] = _lightweight_policy_findings(doc) or [{"message": "✅ No risky actions"}]
+#             results["entity"] = dict(attrs)
+#             results["entity_attached_findings"] = entity_findings
+#         return results
+
+#     # fuzzy matches
+#     close = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.7)
+#     if close:
+#         results["fuzzy_matches"] = close
+#     return results
+
+
+# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None, highlight_color="#ffeb3b", highlight_duration=2200):
+#     """
+#     GOD MODE: Clear "Who can do What" visualization
+#     - Edges have clear labels
+#     - Permissions become ACTION nodes (s3:*, iam:PassRole, etc.)
+#     - Risky actions highlighted in RED
+#     """
+#     G = build_graph(snapshot, show_only_risky=show_only_risky)
+#     if len(G.nodes) == 0:
+#         empty_html = "<div style='text-align:center;padding:100px;font-size:24px;color:#666;'>No entities match current filters</div>"
+#         return nx.DiGraph(), empty_html, None, b"{}", {"reason": "no_matching_nodes"}
+
+#     # Create PyVis network
+#     net = Network(
+#         height="900px",
+#         width="100%",
+#         directed=True,
+#         bgcolor="#ffffff",
+#         font_color="#1e293b"
+#     )
+
 #     net.set_options("""
 #     {
-#       "physics": {"enabled": true, "solver": "repulsion",
-#         "repulsion": {"centralGravity": 0.2, "springLength": 180, "springConstant": 0.02},
-#         "stabilization": {"iterations": 1500, "updateInterval": 25}
+#       "physics": {
+#         "enabled": true,
+#         "solver": "forceAtlas2Based",
+#         "forceAtlas2Based": {"gravitationalConstant": -50, "springLength": 200},
+#         "stabilization": {"iterations": 100}
 #       },
-#       "interaction": {"hover": true, "navigationButtons": true}
+#       "interaction": {
+#         "hover": true,
+#         "navigationButtons": true,
+#         "zoomView": true,
+#         "dragView": true
+#       },
+#       "edges": {
+#         "smooth": false,
+#         "arrows": "to",
+#         "font": {"size": 12, "strokeWidth": 0, "align": "middle"}
+#       }
 #     }
 #     """)
 
-#     impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
+#     # Node styling
+#     def get_node_color(ntype, risky=False):
+#         if risky: return "#ef4444"
+#         return {
+#             "user": "#3b82f6",
+#             "group": "#f59e0b",
+#             "role": "#10b981",
+#             "policy": "#8b5cf6",
+#             "action": "#ec4899",
+#             "principal": "#94a3b8"
+#         }.get(ntype, "#64748b")
 
-#     # nodes
+#     # Add main entities
 #     for node, attrs in G.nodes(data=True):
-#         ntype = attrs.get("type", "node")
+#         ntype = attrs.get("type", "unknown")
+#         label = node
+#         title = node
 #         risky = attrs.get("risky", False)
-#         meta = attrs.get("meta", {})
-#         score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
 
-#         change_flag = meta.get("_changed")
-#         change_details = ""
-#         if change_flag == "added":
-#             change_details = "➕ Added"
-#         elif change_flag == "modified":
-#             change_details = "🔄 Modified"
-
-#         # ---- tooltips with Findings count / TrustFindings count ----
 #         if ntype == "policy":
-#             findings = meta.get("Findings") or []
-#             findings_count = len(findings)
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             tlines = [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: {findings_count}",
-#                 f"Unused Actions: {unused_count}",
-#                 change_details
-#             ] if findings else [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: 0 ✅ No risky actions",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
+#             title = f"Policy: {node}<br>Risk Score: {attrs.get('risk_score', 0)}"
+#             if risky: label = f"{label}"
 #         elif ntype == "role":
-#             trust_find_count = len(meta.get("AssumePolicyFindings") or [])
-#             tlines = [
-#                 f"Role: {meta.get('RoleName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"AssumeRisk: {meta.get('AssumePolicyRisk')}",
-#                 f"AssumeScore: {meta.get('AssumePolicyRiskScore')}",
-#                 f"TrustFindings: {trust_find_count}",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "principal":
-#             tlines = [
-#                 f"Principal: {meta.get('principal')}",
-#                 f"Type: {meta.get('principal_type')}",
-#                 change_details
-#             ]
-#         else:
-#             # user/group default
-#             tlines = [str(meta), change_details]
-#             # Add usage hints for user/group if available
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
+#             title = f"Role: {node}<br>Can be assumed by principals"
+#         elif ntype == "user":
+#             title = f"User: {node}"
 
-#         color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
-#         if risky and not score:
-#             color = "#FF6B6B"
-
-#         size = 18 + (score * 2) if score else 18
-#         if node == highlight_node:
-#             size = max(size, 36)
+#         size = 25 if risky else 20
+#         if highlight_node and node.lower() == highlight_node.lower():
+#             size = 40
+#             color = "#fbbf24"
 
 #         net.add_node(
 #             node,
-#             label=_node_label(node, ntype, risky, score),
-#             title="<br>".join([str(x) for x in tlines if x]),
-#             color=color,
-#             size=size
+#             label=label,
+#             title=f"<b>{title}</b>",
+#             color=get_node_color(ntype, risky),
+#             size=size,
+#             shape="dot" if ntype != "action" else "box"
 #         )
 
-#     # edges (with severity color/thickness for enterprise feel)
-#     for u, v, ed in G.edges(data=True):
-#         rel = ed.get("relation", "")
-#         # Edge severity: color red if source or target risky, thickness based on scores
-#         u_attrs = G.nodes[u]
-#         v_attrs = G.nodes[v]
-#         u_risky = u_attrs.get("risky", False)
-#         v_risky = v_attrs.get("risky", False)
-#         u_score = u_attrs.get("risk_score", 0) or 0
-#         v_score = v_attrs.get("risk_score", 0) or 0
-#         edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-#         # Gray if target policy has unused actions
-#         if v_attrs.get("type") == "policy":
-#             findings = v_attrs.get("meta", {}).get("Findings") or []
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             if unused_count > 0:
-#                 edge_color = "#CCCCCC"
-#         edge_width = 1 + int((u_score + v_score) / 5)  # Scale thickness (max ~5)
-#         if rel == "assumes":
-#             edge_width += 1  # Slightly thicker for assumes
-#         net.add_edge(u, v, title=rel, width=edge_width, color=edge_color)
+#     # Add edges with clear labels
+#     for u, v, data in G.edges(data=True):
+#         rel = data.get("relation", "")
+#         label = ""
+#         color = "#64748b"
+#         dashes = False
 
+#         if rel == "member":
+#             label = "member of"
+#         elif rel == "attached":
+#             label = "has policy"
+#             color = "#8b5cf6"
+#         elif rel == "assumes":
+#             label = "can assume"
+#             color = "#10b981"
+#             dashes = True
+
+#         net.add_edge(u, v, label=label, color=color, dashes=dashes, width=2)
+
+#     # MAIN MAGIC: Extract permissions from policies → create ACTION nodes
+#     action_counter = 0
+#     for policy_node, attrs in G.nodes(data=True):
+#         if attrs.get("type") != "policy":
+#             continue
+#         doc = (attrs.get("meta") or {}).get("Document") or {}
+#         stmts = doc.get("Statement", [])
+#         if not isinstance(stmts, list):
+#             stmts = [stmts]
+
+#         for stmt in stmts:
+#             if stmt.get("Effect") != "Allow":
+#                 continue
+#             actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#             resources = _ensure_list(stmt.get("Resource") or ["*"])
+
+#             for action in actions:
+#                 if not action or action == "*":
+#                     action = "*"
+#                 if isinstance(action, str):
+#                     action = action.strip()
+#                     if not action:
+#                         continue
+
+#                     action_node = f"ACTION_{action_counter}_{action.replace(':', '_').replace('*', 'STAR')}"
+#                     action_counter += 1
+
+#                     is_risky = any(pat in action.lower() for pat in ["*", "passrole", "assumerole", "createpolicy", "attach"])
+#                     action_label = action
+#                     if action == "*":
+#                         action_label = "ALL ACTIONS (*)"
+#                     elif len(action) > 25:
+#                         action_label = action.split(":")[1] if ":" in action else action[:25] + "..."
+
+#                     # Add action node
+#                     net.add_node(
+#                         action_node,
+#                         label=action_label,
+#                         title=f"Permission: {action}<br>Resource: {', '.join(resources)[:100]}",
+#                         color="#ef4444" if is_risky else "#ec4899",
+#                         shape="box",
+#                         size=30 if is_risky else 22
+#                     )
+
+#                     # Connect policy → action
+#                     net.add_edge(
+#                         policy_node, action_node,
+#                         label="allows",
+#                         color="#ef4444" if is_risky else "#ec4899",
+#                         width=3 if is_risky else 2,
+#                         dashes=is_risky
+#                     )
+
+#                     # Connect all entities that have this policy → action
+#                     for predecessor in G.predecessors(policy_node):
+#                         if G.nodes[predecessor].get("type") in ["user", "role", "group"]:
+#                             net.add_edge(
+#                                 predecessor, action_node,
+#                                 label="can do",
+#                                 color="#10b981",
+#                                 width=2,
+#                                 dashes=True
+#                             )
+
+#     # Generate HTML
 #     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
-#     html_path = os.path.join(tmpdir, "iam_graph.html")
+#     html_path = os.path.join(tmpdir, "graph.html")
 #     net.write_html(html_path)
 
 #     with open(html_path, "r", encoding="utf-8") as f:
 #         html_str = f.read()
 
-#     # === Legend with toggle (color matched to NODE_COLORS) ===
-#     legend_html = f"""
-# <div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;">
-#   <div style="font-weight:700;margin-bottom:6px;">Legend</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['user']};border-radius:50%;margin-right:6px;"></span>👤 User</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['group']};border-radius:50%;margin-right:6px;"></span>👥 Group</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['role']};border-radius:50%;margin-right:6px;"></span>🎭 Role</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['policy']};border-radius:50%;margin-right:6px;"></span>📜 Policy</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['principal']};border-radius:50%;margin-right:6px;"></span>🔑 Principal</div>
-#   <div style="margin-top:6px;font-size:12px;color:#ddd;">
-#     <span style="display:inline-block;width:12px;height:12px;background:#FF6B6B;border-radius:50%;margin-right:6px;"></span>🔥 = risky
-#   </div>
-#   <button onclick="toggleLegend()" style="margin-top:5px;padding:2px 6px;font-size:11px;">Toggle</button>
-# </div>
-# <script>
-# function toggleLegend(){{
-#     var lg = document.getElementById('iam_legend');
-#     if(lg.style.display === 'none'){{ lg.style.display='block'; }}
-#     else {{ lg.style.display='none'; }}
-# }}
-# </script>
-# """
+#     # Export
+#     export_path = os.path.join(tempfile.gettempdir(), "iam_xray_graph.json")
+#     export_graph_json(G, export_path)
+#     with open(export_path, "rb") as f:
+#         export_bytes = f.read()
 
-#     impact_overlay = ""
-#     if impact_score is not None:
-#         color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
-#         impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
+#     return G, html_str, None, export_bytes, None
 
-#     # ---- Highlight JS with configurable color/duration ----
-#     # Use str.format with escaped braces to avoid f-string brace issues
-#     highlight_js = """
-# <script type="text/javascript">
-# function _getNodeColor(id) {{
-#     try {{
-#         const n = network.body.data.nodes.get(id);
-#         if(!n) return null;
-#         if(typeof n.color === 'string') return n.color;
-#         if(n.color && n.color.background) return n.color.background;
-#         return null;
-#     }} catch(e) {{ return null; }}
-# }}
-# function _updateNodeColors(updates) {{
-#     try {{ network.body.data.nodes.update(updates); }} catch(e) {{}}
-# }}
-# function highlightPath(nodeId) {{
-#     if(!nodeId) return;
-#     const connected = network.getConnectedNodes(nodeId) || [];
-#     const toHighlight = [nodeId].concat(connected);
-#     const original = {{}};
-#     toHighlight.forEach(id => {{ original[id] = _getNodeColor(id) || null; }});
-#     const upd = toHighlight.map(id => ({{id: id, color: {{background: '{COLOR}'}}}}));
-#     _updateNodeColors(upd);
-#     const connectedEdges = network.getConnectedEdges(nodeId) || [];
-#     const edgeUpdates = connectedEdges.map(eid => {{
-#         try {{
-#             const ed = network.body.data.edges.get(eid);
-#             if(ed) {{ return {{id: eid, width: (ed.width||1) + 3}}; }}
-#         }} catch(e){{}}
-#         return null;
-#     }}).filter(x=>x);
-#     try {{ network.body.data.edges.update(edgeUpdates); }} catch(e) {{}}
-#     setTimeout(()=> {{
-#         const restoreNodes = Object.keys(original).map(id => {{
-#             const orig = original[id];
-#             if(orig) return {{id: id, color: {{background: orig}}}};
-#             return {{id: id}};
-#         }});
-#         try {{ network.body.data.nodes.update(restoreNodes); }} catch(e){{}}
-#         try {{ network.redraw(); }} catch(e){{}}
-#     }}, {DURATION});
-# }}
-# network.on("click", function(params) {{
-#     if (params.nodes.length > 0) {{
-#         const clickedNode = params.nodes[0];
-#         try {{ highlightPath(clickedNode); }} catch(e) {{}}
-#         window.parent.postMessage({{type: "iam_node_click", node: clickedNode}}, "*");
-#         try {{ localStorage.setItem("iam_last_node", clickedNode); }} catch(e){{}}
-#     }}
-# }});
-# try {{
-#     const lastNode = localStorage.getItem("iam_last_node");
-#     if (lastNode) {{
-#         setTimeout(() => {{ try {{ highlightPath(lastNode); }} catch(e){{}} }}, 800);
-#     }}
-# }} catch(e){{}}
-# </script>
-# """.format(COLOR=highlight_color, DURATION=int(highlight_duration))
 
-#     # inject overlays + highlight script
-#     html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-#     html_str = re.sub(r"(</body>)", highlight_js + r"\\1", html_str, flags=re.IGNORECASE)
-
-#     clicked_node = None
-#     return G, html_str, clicked_node
-
-
-
-# # ================== EXTRA HELPERS ==================
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-# def compute_keep_set_from_diff(snapshot):
-#     """
-#     Extract set of entities (names) that are added/modified in diff.
-#     """
-#     d = snapshot.get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"), ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {})
-#         for n in ent_diff.get("added", []) + ent_diff.get("modified", []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G, node):
-#     """
-#     Return predecessors and successors of a node.
-#     """
-#     preds = sorted([n for n in G.predecessors(node)]) if hasattr(G, "predecessors") else []
-#     succs = sorted([n for n in G.successors(node)]) if hasattr(G, "successors") else []
-#     return preds, succs
-
-
-# import networkx as nx
-# from pyvis.network import Network
-# import tempfile
-# import os
-# import logging
-# import re
-# import json
-# import difflib
-# from datetime import datetime, timedelta
-
-# from core import secure_store   # 🔑 new import for encrypted snapshot support
-
-# NODE_COLORS = {
-#     "user": "#3B82F6",     # Blue
-#     "group": "#F59E0B",    # Orange
-#     "role": "#10B981",     # Green
-#     "policy": "#6B7280",   # Gray
-#     "principal": "#9CA3AF" # Light Gray
-# }
-
-# MAX_NODES = 500  # Limit for large graphs
-
-# # ================== NEW HELPERS ==================
-
-# def load_snapshot(path):
-#     """
-#     Load IAM snapshot - supports both encrypted and plaintext.
-#     """
-#     try:
-#         return secure_store.read_and_decrypt(path)
-#     except Exception:
-#         with open(path, "r", encoding="utf-8") as f:
-#             return json.load(f)
-
-# RISKY_PATTERNS = [
-#     r"\*",
-#     r"iam:PassRole",
-#     r"sts:AssumeRole",
-#     r"s3:\*",
-#     r"kms:\*",
-#     r"ec2:\*",
-# ]
-
-# def analyze_policy_document(doc):
-#     """
-#     Scan a policy document and return risky findings (actions with wildcards or sensitive services).
-#     """
-#     findings = []
-#     if not isinstance(doc, dict):
-#         return findings
-
-#     stmts = doc.get("Statement", [])
-#     if isinstance(stmts, dict):
-#         stmts = [stmts]
-
-#     for stmt in stmts:
-#         actions = stmt.get("Action") or stmt.get("NotAction")
-#         if not actions:
-#             continue
-#         if isinstance(actions, str):
-#             actions = [actions]
-#         for act in actions:
-#             for pat in RISKY_PATTERNS:
-#                 if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
-#                     findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
-#     return findings
-
-
-# def search_permissions(G, query):
-#     """
-#     Search who can perform a given action, or what a given entity can do.
-#     - If query looks like 'service:Action', return entities allowed.
-#     - If query matches a node name, return its permissions.
-#     - If no exact match, suggest close matches.
-#     """
-#     results = {}
-#     if not query:
-#         return results
-
-#     query_low = query.lower()
-#     is_regex = query.startswith("/")
-#     if is_regex:
-#         query = query[1:]
-#         query_low = query_low[1:]
-#         try:
-#             regex_pat = re.compile(query, re.IGNORECASE)
-#         except re.error:
-#             return {"error": "Invalid regex pattern"}
-
-#     # Case 1: Action search (e.g., s3:PutObject)
-#     if ":" in query_low:
-#         matches = []
-#         for n, attrs in G.nodes(data=True):
-#             if attrs.get("type") == "policy":
-#                 doc = (attrs.get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     for f in findings:
-#                         act_low = f["action"].lower()
-#                         if (not is_regex and query_low == act_low) or (is_regex and regex_pat.search(act_low)):
-#                             matches.append(n)
-#         # Deep traversal: Find who has access via attached policies
-#         who_can_do = set()
-#         for m in matches:
-#             who_can_do.update(G.predecessors(m))
-#         results["action_search"] = {query: matches}
-#         results["who_can_do"] = list(who_can_do)
-#         return results
-
-#     # Case 2: Entity search
-#     target_node = None
-#     for node in G.nodes:
-#         if node.lower() == query_low:
-#             target_node = node
-#             break
-
-#     if target_node and target_node in G.nodes:
-#         attrs = G.nodes[target_node]
-#         node_type = attrs.get("type")
-#         if node_type == "policy":
-#             doc = (attrs.get("meta") or {}).get("Document")
-#             if doc:
-#                 findings = analyze_policy_document(doc)
-#                 results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
-#         else:
-#             # For user/group/role/principal: find attached/outgoing policies and their findings
-#             attached_policies = [succ for succ in G.successors(target_node) if G.nodes[succ].get("type") == "policy"]
-#             entity_findings = {}
-#             for pname in attached_policies:
-#                 doc = (G.nodes[pname].get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
-#             results["entity"] = dict(attrs)
-#             results["entity_attached_findings"] = entity_findings
-
-#         # Add escalation paths if user/group
-#         if node_type in ("user", "group"):
-#             # Find high-risk targets: roles with high score or "admin" in name
-#             high_risk_roles = [n for n, a in G.nodes(data=True) if a.get("type") == "role" and (a.get("risk_score", 0) > 8 or "admin" in n.lower())]
-#             escalation_paths = []
-#             for target in high_risk_roles:
-#                 try:
-#                     paths = list(nx.all_shortest_paths(G, source=target_node, target=target))
-#                     if paths:
-#                         escalation_paths.append({"target": target, "paths": paths})
-#                 except nx.NetworkXNoPath:
-#                     pass
-#             if escalation_paths:
-#                 results["escalation_paths"] = escalation_paths
-
-#     else:
-#         # No exact node → suggest fuzzy matches
-#         close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
-#         if close_matches:
-#             results["fuzzy_matches"] = close_matches
-
-#     return results
-
-# # ================== EXISTING HELPERS (untouched) ==================
-
-# def _node_label(name, kind, risky=False, score=0):
-#     prefix = {
-#         "user": "👤 ",
-#         "group": "👥 ",
-#         "role": "🎭 ",
-#         "policy": "📜 ",
-#         "principal": "🔑 "
-#     }.get(kind, "")
-#     label = f"{prefix}{name}"
-#     if risky:
-#         label = f"🔥 {label}"
-#     if score and score > 0:
-#         label = f"{label} ({score})"
-#     return label
-
-# def _risk_color(score):
-#     if score is None:
-#         score = 0
-#     score = max(0, min(score, 10))
-#     r = int((score / 10) * 255)
-#     g = int(((10 - score) / 10) * 200)
-#     b = 60 + int((score / 10) * 100)  # Add slight blue gradient for better visual
-#     return f"rgb({r},{g},{b})"
-
-# def compute_keep_set_from_diff(snapshot):
-#     """Return set of entity names that are added/modified (for all entity types)."""
-#     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"),
-#                           ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {}) or {}
-#         for n in (ent_diff.get("added", []) or []) + (ent_diff.get("modified", []) or []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G):
-#     """Return {node: {incoming: [...], outgoing: [...]}}."""
-#     adj = {}
-#     for n in G.nodes:
-#         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
-#         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
-#         adj[n] = {"incoming": incoming, "outgoing": outgoing}
-#     return adj
-
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-
-# def build_graph(snapshot, show_only_risky=False):
-#     """
-#     Pure graph builder (no HTML). Returns a NetworkX.DiGraph.
-#     Mirrors build_iam_graph's node/edge logic.
-#     """
-#     G = nx.DiGraph()
-
-#     # Check for large graphs
-#     total_entities = len(snapshot.get("users", [])) + len(snapshot.get("groups", [])) + len(snapshot.get("roles", [])) + len(snapshot.get("policies", []))
-#     if total_entities > MAX_NODES:
-#         logging.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling risky nodes.")
-#         # Subsample: only add risky nodes and their neighbors
-#         risky_nodes = set()
-#         for u in snapshot.get("users", []):
-#             if u.get("IsRisky"):
-#                 risky_nodes.add(u.get("UserName"))
-#         for g in snapshot.get("groups", []):
-#             if g.get("IsRisky"):
-#                 risky_nodes.add(g.get("GroupName"))
-#         for r in snapshot.get("roles", []):
-#             if r.get("AssumePolicyRisk"):
-#                 risky_nodes.add(r.get("RoleName"))
-#         for p in snapshot.get("policies", []):
-#             if p.get("IsRisky"):
-#                 risky_nodes.add(p.get("PolicyName"))
-#         # But proceed to build full and then subgraph later
-
-#     # Users
-#     for u in snapshot.get("users", []):
-#         name = u.get("UserName")
-#         if name:
-#             risky = bool(u.get("IsRisky"))
-#             G.add_node(name, type="user", risky=risky, meta=u)
-
-#     # Groups
-#     for g in snapshot.get("groups", []):
-#         gname = g.get("GroupName")
-#         if not gname:
-#             continue
-#         risky = bool(g.get("IsRisky"))
-#         G.add_node(gname, type="group", risky=risky, meta=g)
-
-#         for ap in g.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(gname, pname, relation="attached")
-
-#     # Roles
-#     for r in snapshot.get("roles", []):
-#         rname = r.get("RoleName")
-#         if not rname:
-#             continue
-#         role_risk = bool(r.get("AssumePolicyRisk"))
-#         role_score = r.get("AssumePolicyRiskScore") or 0
-#         G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
-
-#         for ap in r.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(rname, pname, relation="attached")
-
-#         for pr in r.get("PrincipalsInfo") or []:
-#             short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
-#             node_name = f"PRINC:{short}"
-#             if not G.has_node(node_name):
-#                 G.add_node(
-#                     node_name, type="principal", risky=False,
-#                     meta={"principal": pr.get("value"), "principal_type": pr.get("type")}
-#                 )
-#             G.add_edge(node_name, rname, relation="assumes")
-
-#     # Policies
-#     for p in snapshot.get("policies", []):
-#         pname = p.get("PolicyName")
-#         if pname:
-#             is_risky = bool(p.get("IsRisky"))
-#             score = p.get("RiskScore") or 0
-#             G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
-
-#     # User → group/policy edges
-#     for u in snapshot.get("users", []):
-#         uname = u.get("UserName")
-#         for gname in u.get("Groups", []) or []:
-#             if G.has_node(gname):
-#                 G.add_edge(uname, gname, relation="member")
-#         for ap in u.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(uname, pname, relation="attached")
-
-#     # Risky-only filter using subgraph_view
-#     if show_only_risky:
-#         def filter_node(n):
-#             return G.nodes[n].get("risky", False)
-#         def filter_edge(u, v):
-#             return filter_node(u) or filter_node(v)
-#         G = nx.subgraph_view(G, filter_node=filter_node, filter_edge=filter_edge)
-
-#     return G
-
-# # ---------- UI graph builder (PyVis HTML) ----------
-# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
-#                     highlight_color="#ffeb3b", highlight_duration=2200):
-#     """
-#     Build IAM graph.
-#     Returns: (G, html_str, clicked_node)
-#     """
-#     # build pure graph first
-#     G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-#     G = G_full  # alias expected by callers
-
-#     # === PyVis Graph ===
-#     net = Network(height="760px", width="100%", notebook=False, directed=True)
-#     net.set_options("""
-#     {
-#       "physics": {"enabled": true, "solver": "repulsion",
-#         "repulsion": {"centralGravity": 0.2, "springLength": 180, "springConstant": 0.02},
-#         "stabilization": {"iterations": 1500, "updateInterval": 25}
-#       },
-#       "interaction": {"hover": true, "navigationButtons": true}
-#     }
-#     """)
-
-#     impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
-
-#     # Batch add nodes
-#     node_list = []
-#     for node, attrs in G.nodes(data=True):
-#         ntype = attrs.get("type", "node")
-#         risky = attrs.get("risky", False)
-#         meta = attrs.get("meta", {})
-#         score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
-
-#         change_flag = meta.get("_changed")
-#         change_details = ""
-#         if change_flag == "added":
-#             change_details = "➕ Added"
-#         elif change_flag == "modified":
-#             change_details = "🔄 Modified"
-
-#         # ---- tooltips with Findings count / TrustFindings count ----
-#         if ntype == "policy":
-#             findings = meta.get("Findings") or []
-#             findings_count = len(findings)
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             tlines = [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: {findings_count}",
-#                 f"Unused Actions: {unused_count}",
-#                 change_details
-#             ] if findings else [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: 0 ✅ No risky actions",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "role":
-#             trust_find_count = len(meta.get("AssumePolicyFindings") or [])
-#             tlines = [
-#                 f"Role: {meta.get('RoleName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"AssumeRisk: {meta.get('AssumePolicyRisk')}",
-#                 f"AssumeScore: {meta.get('AssumePolicyRiskScore')}",
-#                 f"TrustFindings: {trust_find_count}",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "principal":
-#             tlines = [
-#                 f"Principal: {meta.get('principal')}",
-#                 f"Type: {meta.get('principal_type')}",
-#                 change_details
-#             ]
-#         else:
-#             # user/group default
-#             tlines = [str(meta), change_details]
-#             # Add usage hints for user/group if available
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-
-#         color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
-#         if risky and not score:
-#             color = "#FF6B6B"
-
-#         size = 18 + (score * 2) if score else 18
-#         if node == highlight_node:
-#             size = max(size, 36)
-
-#         node_list.append({
-#             "id": node,
-#             "label": _node_label(node, ntype, risky, score),
-#             "title": "<br>".join([str(x) for x in tlines if x]),
-#             "color": color,
-#             "size": size
-#         })
-
-#     net.add_nodes([n["id"] for n in node_list], label=[n["label"] for n in node_list],
-#                   title=[n["title"] for n in node_list], color=[n["color"] for n in node_list],
-#                   size=[n["size"] for n in node_list])
-
-#     # Batch edges
-#     edge_list = []
-#     for u, v, ed in G.edges(data=True):
-#         rel = ed.get("relation", "")
-#         # Edge severity: color red if source or target risky, thickness based on scores
-#         u_attrs = G.nodes[u]
-#         v_attrs = G.nodes[v]
-#         u_risky = u_attrs.get("risky", False)
-#         v_risky = v_attrs.get("risky", False)
-#         u_score = u_attrs.get("risk_score", 0) or 0
-#         v_score = v_attrs.get("risk_score", 0) or 0
-#         edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-#         # Gray if target policy has unused actions
-#         if v_attrs.get("type") == "policy":
-#             findings = v_attrs.get("meta", {}).get("Findings") or []
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             if unused_count > 0:
-#                 edge_color = "#CCCCCC"
-#         edge_width = 1 + int((u_score + v_score) / 5)  # Scale thickness (max ~5)
-#         if rel == "assumes":
-#             edge_width += 1  # Slightly thicker for assumes
-#         edge_list.append({
-#             "from": u,
-#             "to": v,
-#             "title": rel,
-#             "width": edge_width,
-#             "color": edge_color
-#         })
-
-#     net.add_edges([(e["from"], e["to"]) for e in edge_list], title=[e["title"] for e in edge_list],
-#                   width=[e["width"] for e in edge_list], color=[e["color"] for e in edge_list])
-
-#     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
-#     html_path = os.path.join(tmpdir, "iam_graph.html")
-#     net.write_html(html_path)
-
-#     with open(html_path, "r", encoding="utf-8") as f:
-#         html_str = f.read()
-
-#     # === Legend with toggle (color matched to NODE_COLORS) ===
-#     legend_html = f"""
-# <div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;display:none;">
-#   <div style="font-weight:700;margin-bottom:6px;">Legend</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['user']};border-radius:50%;margin-right:6px;"></span>👤 User</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['group']};border-radius:50%;margin-right:6px;"></span>👥 Group</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['role']};border-radius:50%;margin-right:6px;"></span>🎭 Role</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['policy']};border-radius:50%;margin-right:6px;"></span>📜 Policy</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['principal']};border-radius:50%;margin-right:6px;"></span>🔑 Principal</div>
-#   <div style="margin-top:6px;font-size:12px;color:#ddd;">
-#     <span style="display:inline-block;width:12px;height:12px;background:#FF6B6B;border-radius:50%;margin-right:6px;"></span>🔥 = risky
-#   </div>
-#   <button onclick="toggleLegend()" style="margin-top:5px;padding:2px 6px;font-size:11px;">Toggle</button>
-# </div>
-# <script>
-# function toggleLegend(){{
-#     var lg = document.getElementById('iam_legend');
-#     if(lg.style.display === 'none'){{ lg.style.display='block'; }}
-#     else {{ lg.style.display='none'; }}
-# }}
-# </script>
-# """
-
-#     impact_overlay = ""
-#     if impact_score is not None:
-#         color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
-#         impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
-
-#     # ---- Highlight JS with configurable color/duration ----
-#     # Use str.format with escaped braces to avoid f-string brace issues
-#     highlight_js = """
-# <script type="text/javascript">
-# let permanentHighlight = false;
-# function togglePermanentHighlight() {{
-#     permanentHighlight = !permanentHighlight;
-#     // Optionally persist or update UI
-# }}
-# function _getNodeColor(id) {{
-#     try {{
-#         const n = network.body.data.nodes.get(id);
-#         if(!n) return null;
-#         if(typeof n.color === 'string') return n.color;
-#         if(n.color && n.color.background) return n.color.background;
-#         return null;
-#     }} catch(e) {{ return null; }}
-# }}
-# function _updateNodeColors(updates) {{
-#     try {{ network.body.data.nodes.update(updates); }} catch(e) {{}}
-# }}
-# function highlightPath(nodeId) {{
-#     if(!nodeId) return;
-#     const connected = network.getConnectedNodes(nodeId) || [];
-#     const toHighlight = [nodeId].concat(connected);
-#     const original = {{}};
-#     toHighlight.forEach(id => {{ original[id] = _getNodeColor(id) || null; }});
-#     const upd = toHighlight.map(id => ({{id: id, color: {{background: '{COLOR}'}}}}));
-#     _updateNodeColors(upd);
-#     const connectedEdges = network.getConnectedEdges(nodeId) || [];
-#     const edgeUpdates = connectedEdges.map(eid => {{
-#         try {{
-#             const ed = network.body.data.edges.get(eid);
-#             if(ed) {{ return {{id: eid, width: (ed.width||1) + 3}}; }}
-#         }} catch(e){{}}
-#         return null;
-#     }}).filter(x=>x);
-#     try {{ network.body.data.edges.update(edgeUpdates); }} catch(e) {{}}
-#     if (!permanentHighlight) {{
-#         setTimeout(()=> {{
-#             const restoreNodes = Object.keys(original).map(id => {{
-#                 const orig = original[id];
-#                 if(orig) return {{id: id, color: {{background: orig}}}};
-#                 return {{id: id}};
-#             }});
-#             try {{ network.body.data.nodes.update(restoreNodes); }} catch(e){{}}
-#             try {{ network.redraw(); }} catch(e){{}}
-#         }}, {DURATION});
-#     }}
-# }}
-# network.on("click", function(params) {{
-#     if (params.nodes.length > 0) {{
-#         const clickedNode = params.nodes[0];
-#         try {{ highlightPath(clickedNode); }} catch(e) {{}}
-#         window.parent.postMessage({{type: "iam_node_click", node: clickedNode}}, "*");
-#         try {{ localStorage.setItem("iam_last_node", clickedNode); }} catch(e){{}}
-#     }}
-# }});
-# try {{
-#     const lastNode = localStorage.getItem("iam_last_node");
-#     if (lastNode) {{
-#         setTimeout(() => {{ try {{ highlightPath(lastNode); }} catch(e){{}} }}, 800);
-#     }}
-# }} catch(e){{}}
-# </script>
-# """.format(COLOR=highlight_color, DURATION=int(highlight_duration))
-
-#     # inject overlays + highlight script
-#     html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-#     html_str = re.sub(r"(</body>)", highlight_js + r"\\1", html_str, flags=re.IGNORECASE)
-
-#     clicked_node = None
-#     return G, html_str, clicked_node
-
-
-
-# # ================== EXTRA HELPERS ==================
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-# def compute_keep_set_from_diff(snapshot):
-#     """
-#     Extract set of entities (names) that are added/modified in diff.
-#     """
-#     d = snapshot.get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"), ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {})
-#         for n in ent_diff.get("added", []) + ent_diff.get("modified", []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G, node):
-#     """
-#     Return predecessors and successors of a node.
-#     """
-#     preds = sorted([n for n in G.predecessors(node)]) if hasattr(G, "predecessors") else []
-#     succs = sorted([n for n in G.successors(node)]) if hasattr(G, "successors") else []
-#     return preds, succs
-
-
-# import networkx as nx
-# from pyvis.network import Network
-# import tempfile
-# import os
-# import logging
-# import re
-# import json
-# import difflib
-# from datetime import datetime, timedelta
-
-# from core import secure_store   # 🔑 new import for encrypted snapshot support
-
-# NODE_COLORS = {
-#     "user": "#3B82F6",     # Blue
-#     "group": "#F59E0B",    # Orange
-#     "role": "#10B981",     # Green
-#     "policy": "#6B7280",   # Gray
-#     "principal": "#9CA3AF" # Light Gray
-# }
-
-# MAX_NODES = 500  # Limit for large graphs
-
-# # ================== NEW HELPERS ==================
-
-# def load_snapshot(path):
-#     """
-#     Load IAM snapshot - supports both encrypted and plaintext.
-#     """
-#     try:
-#         return secure_store.read_and_decrypt(path)
-#     except Exception:
-#         with open(path, "r", encoding="utf-8") as f:
-#             return json.load(f)
-
-# RISKY_PATTERNS = [
-#     r"\*",
-#     r"iam:PassRole",
-#     r"sts:AssumeRole",
-#     r"s3:\*",
-#     r"kms:\*",
-#     r"ec2:\*",
-# ]
-
-# def analyze_policy_document(doc):
-#     """
-#     Scan a policy document and return risky findings (actions with wildcards or sensitive services).
-#     """
-#     findings = []
-#     if not isinstance(doc, dict):
-#         return findings
-
-#     stmts = doc.get("Statement", [])
-#     if isinstance(stmts, dict):
-#         stmts = [stmts]
-
-#     for stmt in stmts:
-#         actions = stmt.get("Action") or stmt.get("NotAction")
-#         if not actions:
-#             continue
-#         if isinstance(actions, str):
-#             actions = [actions]
-#         for act in actions:
-#             for pat in RISKY_PATTERNS:
-#                 if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
-#                     findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
-#     return findings
-
-
-# def search_permissions(G, query):
-#     """
-#     Search who can perform a given action, or what a given entity can do.
-#     - If query looks like 'service:Action', return entities allowed.
-#     - If query matches a node name, return its permissions.
-#     - If no exact match, suggest close matches.
-#     """
-#     results = {}
-#     if not query:
-#         return results
-
-#     query_low = query.lower()
-#     is_regex = query.startswith("/")
-#     if is_regex:
-#         query = query[1:]
-#         query_low = query_low[1:]
-#         try:
-#             regex_pat = re.compile(query, re.IGNORECASE)
-#         except re.error:
-#             return {"error": "Invalid regex pattern"}
-
-#     # Case 1: Action search (e.g., s3:PutObject)
-#     if ":" in query_low:
-#         matches = []
-#         for n, attrs in G.nodes(data=True):
-#             if attrs.get("type") == "policy":
-#                 doc = (attrs.get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     for f in findings:
-#                         act_low = f["action"].lower()
-#                         if (not is_regex and query_low == act_low) or (is_regex and regex_pat.search(act_low)):
-#                             matches.append(n)
-#         # Deep traversal: Find who has access via attached policies
-#         who_can_do = set()
-#         for m in matches:
-#             who_can_do.update(G.predecessors(m))
-#         results["action_search"] = {query: matches}
-#         results["who_can_do"] = list(who_can_do)
-#         return results
-
-#     # Case 2: Entity search
-#     target_node = None
-#     for node in G.nodes:
-#         if node.lower() == query_low:
-#             target_node = node
-#             break
-
-#     if target_node and target_node in G.nodes:
-#         attrs = G.nodes[target_node]
-#         node_type = attrs.get("type")
-#         if node_type == "policy":
-#             doc = (attrs.get("meta") or {}).get("Document")
-#             if doc:
-#                 findings = analyze_policy_document(doc)
-#                 results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
-#         else:
-#             # For user/group/role/principal: find attached/outgoing policies and their findings
-#             attached_policies = [succ for succ in G.successors(target_node) if G.nodes[succ].get("type") == "policy"]
-#             entity_findings = {}
-#             for pname in attached_policies:
-#                 doc = (G.nodes[pname].get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
-#             results["entity"] = dict(attrs)
-#             results["entity_attached_findings"] = entity_findings
-
-#         # Add escalation paths if user/group
-#         if node_type in ("user", "group"):
-#             # Find high-risk targets: roles with high score or "admin" in name
-#             high_risk_roles = [n for n, a in G.nodes(data=True) if a.get("type") == "role" and (a.get("risk_score", 0) > 8 or "admin" in n.lower())]
-#             escalation_paths = []
-#             for target in high_risk_roles:
-#                 try:
-#                     paths = list(nx.all_shortest_paths(G, source=target_node, target=target))
-#                     if paths:
-#                         escalation_paths.append({"target": target, "paths": paths})
-#                 except nx.NetworkXNoPath:
-#                     pass
-#             if escalation_paths:
-#                 results["escalation_paths"] = escalation_paths
-
-#     else:
-#         # No exact node → suggest fuzzy matches
-#         close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
-#         if close_matches:
-#             results["fuzzy_matches"] = close_matches
-
-#     return results
-
-# # ================== EXISTING HELPERS (untouched) ==================
-
-# def _node_label(name, kind, risky=False, score=0):
-#     prefix = {
-#         "user": "👤 ",
-#         "group": "👥 ",
-#         "role": "🎭 ",
-#         "policy": "📜 ",
-#         "principal": "🔑 "
-#     }.get(kind, "")
-#     label = f"{prefix}{name}"
-#     if risky:
-#         label = f"🔥 {label}"
-#     if score and score > 0:
-#         label = f"{label} ({score})"
-#     return label
-
-# def _risk_color(score):
-#     if score is None:
-#         score = 0
-#     score = max(0, min(score, 10))
-#     r = int((score / 10) * 255)
-#     g = int(((10 - score) / 10) * 200)
-#     b = 60 + int((score / 10) * 100)  # Add slight blue gradient for better visual
-#     return f"rgb({r},{g},{b})"
-
-# def compute_keep_set_from_diff(snapshot):
-#     """Return set of entity names that are added/modified (for all entity types)."""
-#     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"),
-#                           ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {}) or {}
-#         for n in (ent_diff.get("added", []) or []) + (ent_diff.get("modified", []) or []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G):
-#     """Return {node: {incoming: [...], outgoing: [...]}}."""
-#     adj = {}
-#     for n in G.nodes:
-#         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
-#         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
-#         adj[n] = {"incoming": incoming, "outgoing": outgoing}
-#     return adj
-
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-
-# def build_graph(snapshot, show_only_risky=False):
-#     """
-#     Pure graph builder (no HTML). Returns a NetworkX.DiGraph.
-#     Mirrors build_iam_graph's node/edge logic.
-#     """
-#     G = nx.DiGraph()
-
-#     # Check for large graphs
-#     total_entities = len(snapshot.get("users", [])) + len(snapshot.get("groups", [])) + len(snapshot.get("roles", [])) + len(snapshot.get("policies", []))
-#     if total_entities > MAX_NODES:
-#         logging.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling risky nodes.")
-#         # Subsample: only add risky nodes and their neighbors
-#         risky_nodes = set()
-#         for u in snapshot.get("users", []):
-#             if u.get("IsRisky"):
-#                 risky_nodes.add(u.get("UserName"))
-#         for g in snapshot.get("groups", []):
-#             if g.get("IsRisky"):
-#                 risky_nodes.add(g.get("GroupName"))
-#         for r in snapshot.get("roles", []):
-#             if r.get("AssumePolicyRisk"):
-#                 risky_nodes.add(r.get("RoleName"))
-#         for p in snapshot.get("policies", []):
-#             if p.get("IsRisky"):
-#                 risky_nodes.add(p.get("PolicyName"))
-#         # But proceed to build full and then subgraph later
-
-#     # Users
-#     for u in snapshot.get("users", []):
-#         name = u.get("UserName")
-#         if name:
-#             risky = bool(u.get("IsRisky"))
-#             G.add_node(name, type="user", risky=risky, meta=u)
-
-#     # Groups
-#     for g in snapshot.get("groups", []):
-#         gname = g.get("GroupName")
-#         if not gname:
-#             continue
-#         risky = bool(g.get("IsRisky"))
-#         G.add_node(gname, type="group", risky=risky, meta=g)
-
-#         for ap in g.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(gname, pname, relation="attached")
-
-#     # Roles
-#     for r in snapshot.get("roles", []):
-#         rname = r.get("RoleName")
-#         if not rname:
-#             continue
-#         role_risk = bool(r.get("AssumePolicyRisk"))
-#         role_score = r.get("AssumePolicyRiskScore") or 0
-#         G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
-
-#         for ap in r.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(rname, pname, relation="attached")
-
-#         for pr in r.get("PrincipalsInfo") or []:
-#             short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
-#             node_name = f"PRINC:{short}"
-#             if not G.has_node(node_name):
-#                 G.add_node(
-#                     node_name, type="principal", risky=False,
-#                     meta={"principal": pr.get("value"), "principal_type": pr.get("type")}
-#                 )
-#             G.add_edge(node_name, rname, relation="assumes")
-
-#     # Policies
-#     for p in snapshot.get("policies", []):
-#         pname = p.get("PolicyName")
-#         if pname:
-#             is_risky = bool(p.get("IsRisky"))
-#             score = p.get("RiskScore") or 0
-#             G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
-
-#     # User → group/policy edges
-#     for u in snapshot.get("users", []):
-#         uname = u.get("UserName")
-#         for gname in u.get("Groups", []) or []:
-#             if G.has_node(gname):
-#                 G.add_edge(uname, gname, relation="member")
-#         for ap in u.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(uname, pname, relation="attached")
-
-#     # Risky-only filter using subgraph_view
-#     if show_only_risky:
-#         def filter_node(n):
-#             return G.nodes[n].get("risky", False)
-#         def filter_edge(u, v):
-#             return filter_node(u) or filter_node(v)
-#         G = nx.subgraph_view(G, filter_node=filter_node, filter_edge=filter_edge)
-
-#     return G
-
-# # ---------- UI graph builder (PyVis HTML) ----------
-# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
-#                     highlight_color="#ffeb3b", highlight_duration=2200):
-#     """
-#     Build IAM graph.
-#     Returns: (G, html_str, clicked_node)
-#     """
-#     # build pure graph first
-#     G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-#     G = G_full  # alias expected by callers
-
-#     # === PyVis Graph ===
-#     net = Network(height="760px", width="100%", notebook=False, directed=True)
-#     net.set_options("""
-#     {
-#       "physics": {"enabled": true, "solver": "repulsion",
-#         "repulsion": {"centralGravity": 0.2, "springLength": 180, "springConstant": 0.02},
-#         "stabilization": {"iterations": 1500, "updateInterval": 25}
-#       },
-#       "interaction": {"hover": true, "navigationButtons": true}
-#     }
-#     """)
-
-#     impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
-
-#     # Batch add nodes
-#     node_list = []
-#     for node, attrs in G.nodes(data=True):
-#         ntype = attrs.get("type", "node")
-#         risky = attrs.get("risky", False)
-#         meta = attrs.get("meta", {})
-#         score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
-
-#         change_flag = meta.get("_changed")
-#         change_details = ""
-#         if change_flag == "added":
-#             change_details = "➕ Added"
-#         elif change_flag == "modified":
-#             change_details = "🔄 Modified"
-
-#         # ---- tooltips with Findings count / TrustFindings count ----
-#         if ntype == "policy":
-#             findings = meta.get("Findings") or []
-#             findings_count = len(findings)
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             tlines = [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: {findings_count}",
-#                 f"Unused Actions: {unused_count}",
-#                 change_details
-#             ] if findings else [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: 0 ✅ No risky actions",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("last_authenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("last_authenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "role":
-#             trust_find_count = len(meta.get("AssumePolicyFindings") or [])
-#             tlines = [
-#                 f"Role: {meta.get('RoleName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"AssumeRisk: {meta.get('AssumePolicyRisk')}",
-#                 f"AssumeScore: {meta.get('AssumePolicyRiskScore')}",
-#                 f"TrustFindings: {trust_find_count}",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("last_authenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("last_authenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "principal":
-#             tlines = [
-#                 f"Principal: {meta.get('principal')}",
-#                 f"Type: {meta.get('principal_type')}",
-#                 change_details
-#             ]
-#         else:
-#             # user/group default
-#             tlines = [str(meta), change_details]
-#             # Add usage hints for user/group if available
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("last_authenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("last_authenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-
-#         color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
-#         if risky and not score:
-#             color = "#FF6B6B"
-
-#         size = 18 + (score * 2) if score else 18
-#         if node == highlight_node:
-#             size = max(size, 36)
-
-#         node_list.append({
-#             "id": node,
-#             "label": _node_label(node, ntype, risky, score),
-#             "title": "<br>".join([str(x) for x in tlines if x]),
-#             "color": color,
-#             "size": size
-#         })
-
-#     net.add_nodes([n["id"] for n in node_list], label=[n["label"] for n in node_list],
-#                   title=[n["title"] for n in node_list], color=[n["color"] for n in node_list],
-#                   size=[n["size"] for n in node_list])
-
-#     # Batch edges - but since add_edges may not support all kwargs in batch, loop add_edge
-#     for u, v, ed in G.edges(data=True):
-#         rel = ed.get("relation", "")
-#         # Edge severity: color red if source or target risky, thickness based on scores
-#         u_attrs = G.nodes[u]
-#         v_attrs = G.nodes[v]
-#         u_risky = u_attrs.get("risky", False)
-#         v_risky = v_attrs.get("risky", False)
-#         u_score = u_attrs.get("risk_score", 0) or 0
-#         v_score = v_attrs.get("risk_score", 0) or 0
-#         edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-#         # Gray if target policy has unused actions
-#         if v_attrs.get("type") == "policy":
-#             findings = v_attrs.get("meta", {}).get("Findings") or []
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             if unused_count > 0:
-#                 edge_color = "#CCCCCC"
-#         edge_width = 1 + int((u_score + v_score) / 5)  # Scale thickness (max ~5)
-#         if rel == "assumes":
-#             edge_width += 1  # Slightly thicker for assumes
-#         net.add_edge(u, v, title=rel, width=edge_width, color=edge_color)
-
-#     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
-#     html_path = os.path.join(tmpdir, "iam_graph.html")
-#     net.write_html(html_path)
-
-#     with open(html_path, "r", encoding="utf-8") as f:
-#         html_str = f.read()
-
-#     # === Legend with toggle (color matched to NODE_COLORS) ===
-#     legend_html = f"""
-# <div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;display:none;">
-#   <div style="font-weight:700;margin-bottom:6px;">Legend</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['user']};border-radius:50%;margin-right:6px;"></span>👤 User</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['group']};border-radius:50%;margin-right:6px;"></span>👥 Group</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['role']};border-radius:50%;margin-right:6px;"></span>🎭 Role</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['policy']};border-radius:50%;margin-right:6px;"></span>📜 Policy</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['principal']};border-radius:50%;margin-right:6px;"></span>🔑 Principal</div>
-#   <div style="margin-top:6px;font-size:12px;color:#ddd;">
-#     <span style="display:inline-block;width:12px;height:12px;background:#FF6B6B;border-radius:50%;margin-right:6px;"></span>🔥 = risky
-#   </div>
-#   <button onclick="toggleLegend()" style="margin-top:5px;padding:2px 6px;font-size:11px;">Toggle</button>
-# </div>
-# <script>
-# function toggleLegend(){{
-#     var lg = document.getElementById('iam_legend');
-#     if(lg.style.display === 'none'){{ lg.style.display='block'; }}
-#     else {{ lg.style.display='none'; }}
-# }}
-# </script>
-# """
-
-#     impact_overlay = ""
-#     if impact_score is not None:
-#         color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
-#         impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
-
-#     # ---- Highlight JS with configurable color/duration ----
-#     # Use str.format with escaped braces to avoid f-string brace issues
-#     highlight_js = """
-# <script type="text/javascript">
-# let permanentHighlight = false;
-# function togglePermanentHighlight() {{
-#     permanentHighlight = !permanentHighlight;
-#     // Optionally persist or update UI
-# }}
-# function _getNodeColor(id) {{
-#     try {{
-#         const n = network.body.data.nodes.get(id);
-#         if(!n) return null;
-#         if(typeof n.color === 'string') return n.color;
-#         if(n.color && n.color.background) return n.color.background;
-#         return null;
-#     }} catch(e) {{ return null; }}
-# }}
-# function _updateNodeColors(updates) {{
-#     try {{ network.body.data.nodes.update(updates); }} catch(e) {{}}
-# }}
-# function highlightPath(nodeId) {{
-#     if(!nodeId) return;
-#     const connected = network.getConnectedNodes(nodeId) || [];
-#     const toHighlight = [nodeId].concat(connected);
-#     const original = {{}};
-#     toHighlight.forEach(id => {{ original[id] = _getNodeColor(id) || null; }});
-#     const upd = toHighlight.map(id => ({{id: id, color: {{background: '{COLOR}'}}}}));
-#     _updateNodeColors(upd);
-#     const connectedEdges = network.getConnectedEdges(nodeId) || [];
-#     const edgeUpdates = connectedEdges.map(eid => {{
-#         try {{
-#             const ed = network.body.data.edges.get(eid);
-#             if(ed) {{ return {{id: eid, width: (ed.width||1) + 3}}; }}
-#         }} catch(e){{}}
-#         return null;
-#     }}).filter(x=>x);
-#     try {{ network.body.data.edges.update(edgeUpdates); }} catch(e) {{}}
-#     if (!permanentHighlight) {{
-#         setTimeout(()=> {{
-#             const restoreNodes = Object.keys(original).map(id => {{
-#                 const orig = original[id];
-#                 if(orig) return {{id: id, color: {{background: orig}}}};
-#                 return {{id: id}};
-#             }});
-#             try {{ network.body.data.nodes.update(restoreNodes); }} catch(e){{}}
-#             try {{ network.redraw(); }} catch(e){{}}
-#         }}, {DURATION});
-#     }}
-# }}
-# network.on("click", function(params) {{
-#     if (params.nodes.length > 0) {{
-#         const clickedNode = params.nodes[0];
-#         try {{ highlightPath(clickedNode); }} catch(e) {{}}
-#         window.parent.postMessage({{type: "iam_node_click", node: clickedNode}}, "*");
-#         try {{ localStorage.setItem("iam_last_node", clickedNode); }} catch(e){{}}
-#     }}
-# }});
-# try {{
-#     const lastNode = localStorage.getItem("iam_last_node");
-#     if (lastNode) {{
-#         setTimeout(() => {{ try {{ highlightPath(lastNode); }} catch(e){{}} }}, 800);
-#     }}
-# }} catch(e){{}}
-# </script>
-# """.format(COLOR=highlight_color, DURATION=int(highlight_duration))
-
-#     # inject overlays + highlight script
-#     html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-#     html_str = re.sub(r"(</body>)", highlight_js + r"\\1", html_str, flags=re.IGNORECASE)
-
-#     clicked_node = None
-#     return G, html_str, clicked_node
-
-
-
-# # ================== EXTRA HELPERS ==================
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-# def compute_keep_set_from_diff(snapshot):
-#     """
-#     Extract set of entities (names) that are added/modified in diff.
-#     """
-#     d = snapshot.get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"), ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {})
-#         for n in ent_diff.get("added", []) + ent_diff.get("modified", []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G, node):
-#     """
-#     Return predecessors and successors of a node.
-#     """
-#     preds = sorted([n for n in G.predecessors(node)]) if hasattr(G, "predecessors") else []
-#     succs = sorted([n for n in G.successors(node)]) if hasattr(G, "successors") else []
-#     return preds, succs
-
-
-# import networkx as nx
-# from pyvis.network import Network
-# import tempfile
-# import os
-# import logging
-# import re
-# import json
-# import difflib
-# from datetime import datetime, timedelta
-
-# from core import secure_store   # 🔑 new import for encrypted snapshot support
-
-# NODE_COLORS = {
-#     "user": "#3B82F6",     # Blue
-#     "group": "#F59E0B",    # Orange
-#     "role": "#10B981",     # Green
-#     "policy": "#6B7280",   # Gray
-#     "principal": "#9CA3AF" # Light Gray
-# }
-
-# MAX_NODES = 500  # Limit for large graphs
-
-# # ================== NEW HELPERS ==================
-
-# def load_snapshot(path):
-#     """
-#     Load IAM snapshot - supports both encrypted and plaintext.
-#     """
-#     try:
-#         return secure_store.read_and_decrypt(path)
-#     except Exception:
-#         with open(path, "r", encoding="utf-8") as f:
-#             return json.load(f)
-
-# RISKY_PATTERNS = [
-#     r"\*",
-#     r"iam:PassRole",
-#     r"sts:AssumeRole",
-#     r"s3:\*",
-#     r"kms:\*",
-#     r"ec2:\*",
-# ]
-
-# def analyze_policy_document(doc):
-#     """
-#     Scan a policy document and return risky findings (actions with wildcards or sensitive services).
-#     """
-#     findings = []
-#     if not isinstance(doc, dict):
-#         return findings
-
-#     stmts = doc.get("Statement", [])
-#     if isinstance(stmts, dict):
-#         stmts = [stmts]
-
-#     for stmt in stmts:
-#         actions = stmt.get("Action") or stmt.get("NotAction")
-#         if not actions:
-#             continue
-#         if isinstance(actions, str):
-#             actions = [actions]
-#         for act in actions:
-#             for pat in RISKY_PATTERNS:
-#                 if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
-#                     findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
-#     return findings
-
-
-# def search_permissions(G, query):
-#     """
-#     Search who can perform a given action, or what a given entity can do.
-#     - If query looks like 'service:Action', return entities allowed.
-#     - If query matches a node name, return its permissions.
-#     - If no exact match, suggest close matches.
-#     """
-#     results = {}
-#     if not query:
-#         return results
-
-#     query_low = query.lower()
-#     is_regex = query.startswith("/")
-#     if is_regex:
-#         query = query[1:]
-#         query_low = query_low[1:]
-#         try:
-#             regex_pat = re.compile(query, re.IGNORECASE)
-#         except re.error:
-#             return {"error": "Invalid regex pattern"}
-
-#     # Case 1: Action search (e.g., s3:PutObject)
-#     if ":" in query_low:
-#         matches = []
-#         for n, attrs in G.nodes(data=True):
-#             if attrs.get("type") == "policy":
-#                 doc = (attrs.get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     for f in findings:
-#                         act_low = f["action"].lower()
-#                         if (not is_regex and query_low == act_low) or (is_regex and regex_pat.search(act_low)):
-#                             matches.append(n)
-#         # Deep traversal: Find who has access via attached policies
-#         who_can_do = set()
-#         for m in matches:
-#             who_can_do.update(G.predecessors(m))
-#         results["action_search"] = {query: matches}
-#         results["who_can_do"] = list(who_can_do)
-#         return results
-
-#     # Case 2: Entity search
-#     target_node = None
-#     for node in G.nodes:
-#         if node.lower() == query_low:
-#             target_node = node
-#             break
-
-#     if target_node and target_node in G.nodes:
-#         attrs = G.nodes[target_node]
-#         node_type = attrs.get("type")
-#         if node_type == "policy":
-#             doc = (attrs.get("meta") or {}).get("Document")
-#             if doc:
-#                 findings = analyze_policy_document(doc)
-#                 results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
-#         else:
-#             # For user/group/role/principal: find attached/outgoing policies and their findings
-#             attached_policies = [succ for succ in G.successors(target_node) if G.nodes[succ].get("type") == "policy"]
-#             entity_findings = {}
-#             for pname in attached_policies:
-#                 doc = (G.nodes[pname].get("meta") or {}).get("Document")
-#                 if doc:
-#                     findings = analyze_policy_document(doc)
-#                     entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
-#             results["entity"] = dict(attrs)
-#             results["entity_attached_findings"] = entity_findings
-
-#         # Add escalation paths if user/group
-#         if node_type in ("user", "group"):
-#             # Find high-risk targets: roles with high score or "admin" in name
-#             high_risk_roles = [n for n, a in G.nodes(data=True) if a.get("type") == "role" and (a.get("risk_score", 0) > 8 or "admin" in n.lower())]
-#             escalation_paths = []
-#             for target in high_risk_roles:
-#                 try:
-#                     paths = list(nx.all_shortest_paths(G, source=target_node, target=target))
-#                     if paths:
-#                         escalation_paths.append({"target": target, "paths": paths})
-#                 except nx.NetworkXNoPath:
-#                     pass
-#             if escalation_paths:
-#                 results["escalation_paths"] = escalation_paths
-
-#     else:
-#         # No exact node → suggest fuzzy matches
-#         close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
-#         if close_matches:
-#             results["fuzzy_matches"] = close_matches
-
-#     return results
-
-# # ================== EXISTING HELPERS (untouched) ==================
-
-# def _node_label(name, kind, risky=False, score=0):
-#     prefix = {
-#         "user": "👤 ",
-#         "group": "👥 ",
-#         "role": "🎭 ",
-#         "policy": "📜 ",
-#         "principal": "🔑 "
-#     }.get(kind, "")
-#     label = f"{prefix}{name}"
-#     if risky:
-#         label = f"🔥 {label}"
-#     if score and score > 0:
-#         label = f"{label} ({score})"
-#     return label
-
-# def _risk_color(score):
-#     if score is None:
-#         score = 0
-#     score = max(0, min(score, 10))
-#     r = int((score / 10) * 255)
-#     g = int(((10 - score) / 10) * 200)
-#     b = 60 + int((score / 10) * 100)  # Add slight blue gradient for better visual
-#     return f"rgb({r},{g},{b})"
-
-# def compute_keep_set_from_diff(snapshot):
-#     """Return set of entity names that are added/modified (for all entity types)."""
-#     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"),
-#                           ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {}) or {}
-#         for n in (ent_diff.get("added", []) or []) + (ent_diff.get("modified", []) or []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G):
-#     """Return {node: {incoming: [...], outgoing: [...]}}."""
-#     adj = {}
-#     for n in G.nodes:
-#         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
-#         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
-#         adj[n] = {"incoming": incoming, "outgoing": outgoing}
-#     return adj
-
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-
-# def build_graph(snapshot, show_only_risky=False):
-#     """
-#     Pure graph builder (no HTML). Returns a NetworkX.DiGraph.
-#     Mirrors build_iam_graph's node/edge logic.
-#     """
-#     G = nx.DiGraph()
-
-#     # Check for large graphs
-#     total_entities = len(snapshot.get("users", [])) + len(snapshot.get("groups", [])) + len(snapshot.get("roles", [])) + len(snapshot.get("policies", []))
-#     if total_entities > MAX_NODES:
-#         logging.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling risky nodes.")
-#         # Subsample: only add risky nodes and their neighbors
-#         risky_nodes = set()
-#         for u in snapshot.get("users", []):
-#             if u.get("IsRisky"):
-#                 risky_nodes.add(u.get("UserName"))
-#         for g in snapshot.get("groups", []):
-#             if g.get("IsRisky"):
-#                 risky_nodes.add(g.get("GroupName"))
-#         for r in snapshot.get("roles", []):
-#             if r.get("AssumePolicyRisk"):
-#                 risky_nodes.add(r.get("RoleName"))
-#         for p in snapshot.get("policies", []):
-#             if p.get("IsRisky"):
-#                 risky_nodes.add(p.get("PolicyName"))
-#         # But proceed to build full and then subgraph later
-
-#     # Users
-#     for u in snapshot.get("users", []):
-#         name = u.get("UserName")
-#         if name:
-#             risky = bool(u.get("IsRisky"))
-#             G.add_node(name, type="user", risky=risky, meta=u)
-
-#     # Groups
-#     for g in snapshot.get("groups", []):
-#         gname = g.get("GroupName")
-#         if not gname:
-#             continue
-#         risky = bool(g.get("IsRisky"))
-#         G.add_node(gname, type="group", risky=risky, meta=g)
-
-#         for ap in g.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(gname, pname, relation="attached")
-
-#     # Roles
-#     for r in snapshot.get("roles", []):
-#         rname = r.get("RoleName")
-#         if not rname:
-#             continue
-#         role_risk = bool(r.get("AssumePolicyRisk"))
-#         role_score = r.get("AssumePolicyRiskScore") or 0
-#         G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
-
-#         for ap in r.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(rname, pname, relation="attached")
-
-#         for pr in r.get("PrincipalsInfo") or []:
-#             short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
-#             node_name = f"PRINC:{short}"
-#             if not G.has_node(node_name):
-#                 G.add_node(
-#                     node_name, type="principal", risky=False,
-#                     meta={"principal": pr.get("value"), "principal_type": pr.get("type")}
-#                 )
-#             G.add_edge(node_name, rname, relation="assumes")
-
-#     # Policies
-#     for p in snapshot.get("policies", []):
-#         pname = p.get("PolicyName")
-#         if pname:
-#             is_risky = bool(p.get("IsRisky"))
-#             score = p.get("RiskScore") or 0
-#             G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
-
-#     # User → group/policy edges
-#     for u in snapshot.get("users", []):
-#         uname = u.get("UserName")
-#         for gname in u.get("Groups", []) or []:
-#             if G.has_node(gname):
-#                 G.add_edge(uname, gname, relation="member")
-#         for ap in u.get("AttachedPolicies", []) or []:
-#             pname = ap.get("PolicyName")
-#             if pname:
-#                 if not G.has_node(pname):
-#                     G.add_node(pname, type="policy", risky=False, meta={})
-#                 G.add_edge(uname, pname, relation="attached")
-
-#     # Risky-only filter using subgraph_view
-#     if show_only_risky:
-#         def filter_node(n):
-#             return G.nodes[n].get("risky", False)
-#         def filter_edge(u, v):
-#             return filter_node(u) or filter_node(v)
-#         G = nx.subgraph_view(G, filter_node=filter_node, filter_edge=filter_edge)
-
-#     return G
-
-# # ---------- UI graph builder (PyVis HTML) ----------
-# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
-#                     highlight_color="#ffeb3b", highlight_duration=2200):
-#     """
-#     Build IAM graph.
-#     Returns: (G, html_str, clicked_node)
-#     """
-#     # build pure graph first
-#     G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-#     G = G_full  # alias expected by callers
-
-#     # === PyVis Graph ===
-#     net = Network(height="760px", width="100%", notebook=False, directed=True)
-#     net.set_options("""
-#     {
-#       "physics": {"enabled": true, "solver": "repulsion",
-#         "repulsion": {"centralGravity": 0.2, "springLength": 180, "springConstant": 0.02},
-#         "stabilization": {"iterations": 1500, "updateInterval": 25}
-#       },
-#       "interaction": {"hover": true, "navigationButtons": true}
-#     }
-#     """)
-
-#     impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
-
-#     # Batch add nodes
-#     node_list = []
-#     for node, attrs in G.nodes(data=True):
-#         ntype = attrs.get("type", "node")
-#         risky = attrs.get("risky", False)
-#         meta = attrs.get("meta", {})
-#         score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
-
-#         change_flag = meta.get("_changed")
-#         change_details = ""
-#         if change_flag == "added":
-#             change_details = "➕ Added"
-#         elif change_flag == "modified":
-#             change_details = "🔄 Modified"
-
-#         # ---- tooltips with Findings count / TrustFindings count ----
-#         if ntype == "policy":
-#             findings = meta.get("Findings") or []
-#             findings_count = len(findings)
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             tlines = [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: {findings_count}",
-#                 f"Unused Actions: {unused_count}",
-#                 change_details
-#             ] if findings else [
-#                 f"Policy: {meta.get('PolicyName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"IsRisky: {meta.get('IsRisky')}",
-#                 f"RiskScore: {meta.get('RiskScore')}",
-#                 f"Findings: 0 ✅ No risky actions",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "role":
-#             trust_find_count = len(meta.get("AssumePolicyFindings") or [])
-#             tlines = [
-#                 f"Role: {meta.get('RoleName')}",
-#                 f"Arn: {meta.get('Arn')}",
-#                 f"AssumeRisk: {meta.get('AssumePolicyRisk')}",
-#                 f"AssumeScore: {meta.get('AssumePolicyRiskScore')}",
-#                 f"TrustFindings: {trust_find_count}",
-#                 change_details
-#             ]
-#             # Add usage hints to tooltips
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-#         elif ntype == "principal":
-#             tlines = [
-#                 f"Principal: {meta.get('principal')}",
-#                 f"Type: {meta.get('principal_type')}",
-#                 change_details
-#             ]
-#         else:
-#             # user/group default
-#             tlines = [str(meta), change_details]
-#             # Add usage hints for user/group if available
-#             slu = meta.get("ServiceLastUsed", {})
-#             services = slu.get("services", [])
-#             unused = [s.get("serviceNamespace") for s in services if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-#             if unused:
-#                 tlines.append("Unused services: " + ", ".join(unused))
-
-#         color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
-#         if risky and not score:
-#             color = "#FF6B6B"
-
-#         size = 18 + (score * 2) if score else 18
-#         if node == highlight_node:
-#             size = max(size, 36)
-
-#         node_list.append({
-#             "id": node,
-#             "label": _node_label(node, ntype, risky, score),
-#             "title": "<br>".join([str(x) for x in tlines if x]),
-#             "color": color,
-#             "size": size
-#         })
-
-#     net.add_nodes([n["id"] for n in node_list], label=[n["label"] for n in node_list],
-#                   title=[n["title"] for n in node_list], color=[n["color"] for n in node_list],
-#                   size=[n["size"] for n in node_list])
-
-#     # Batch edges - but since add_edges may not support all kwargs in batch, loop add_edge
-#     for u, v, ed in G.edges(data=True):
-#         rel = ed.get("relation", "")
-#         # Edge severity: color red if source or target risky, thickness based on scores
-#         u_attrs = G.nodes[u]
-#         v_attrs = G.nodes[v]
-#         u_risky = u_attrs.get("risky", False)
-#         v_risky = v_attrs.get("risky", False)
-#         u_score = u_attrs.get("risk_score", 0) or 0
-#         v_score = v_attrs.get("risk_score", 0) or 0
-#         edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-#         # Gray if target policy has unused actions
-#         if v_attrs.get("type") == "policy":
-#             findings = v_attrs.get("meta", {}).get("Findings") or []
-#             unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-#             if unused_count > 0:
-#                 edge_color = "#CCCCCC"
-#         edge_width = 1 + int((u_score + v_score) / 5)  # Scale thickness (max ~5)
-#         if rel == "assumes":
-#             edge_width += 1  # Slightly thicker for assumes
-#         net.add_edge(u, v, title=rel, width=edge_width, color=edge_color)
-
-#     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
-#     html_path = os.path.join(tmpdir, "iam_graph.html")
-#     net.write_html(html_path)
-
-#     with open(html_path, "r", encoding="utf-8") as f:
-#         html_str = f.read()
-
-#     # === Legend with toggle (color matched to NODE_COLORS) ===
-#     legend_html = f"""
-# <div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;display:none;">
-#   <div style="font-weight:700;margin-bottom:6px;">Legend</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['user']};border-radius:50%;margin-right:6px;"></span>👤 User</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['group']};border-radius:50%;margin-right:6px;"></span>👥 Group</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['role']};border-radius:50%;margin-right:6px;"></span>🎭 Role</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['policy']};border-radius:50%;margin-right:6px;"></span>📜 Policy</div>
-#   <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['principal']};border-radius:50%;margin-right:6px;"></span>🔑 Principal</div>
-#   <div style="margin-top:6px;font-size:12px;color:#ddd;">
-#     <span style="display:inline-block;width:12px;height:12px;background:#FF6B6B;border-radius:50%;margin-right:6px;"></span>🔥 = risky
-#   </div>
-#   <button onclick="toggleLegend()" style="margin-top:5px;padding:2px 6px;font-size:11px;">Toggle</button>
-# </div>
-# <script>
-# function toggleLegend(){{
-#     var lg = document.getElementById('iam_legend');
-#     if(lg.style.display === 'none'){{ lg.style.display='block'; }}
-#     else {{ lg.style.display='none'; }}
-# }}
-# </script>
-# """
-
-#     impact_overlay = ""
-#     if impact_score is not None:
-#         color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
-#         impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
-
-#     # ---- Highlight JS with configurable color/duration ----
-#     # Use str.format with escaped braces to avoid f-string brace issues
-#     highlight_js = """
-# <script type="text/javascript">
-# let permanentHighlight = false;
-# function togglePermanentHighlight() {{
-#     permanentHighlight = !permanentHighlight;
-#     // Optionally persist or update UI
-# }}
-# function _getNodeColor(id) {{
-#     try {{
-#         const n = network.body.data.nodes.get(id);
-#         if(!n) return null;
-#         if(typeof n.color === 'string') return n.color;
-#         if(n.color && n.color.background) return n.color.background;
-#         return null;
-#     }} catch(e) {{ return null; }}
-# }}
-# function _updateNodeColors(updates) {{
-#     try {{ network.body.data.nodes.update(updates); }} catch(e) {{}}
-# }}
-# function highlightPath(nodeId) {{
-#     if(!nodeId) return;
-#     const connected = network.getConnectedNodes(nodeId) || [];
-#     const toHighlight = [nodeId].concat(connected);
-#     const original = {{}};
-#     toHighlight.forEach(id => {{ original[id] = _getNodeColor(id) || null; }});
-#     const upd = toHighlight.map(id => ({{id: id, color: {{background: '{COLOR}'}}}}));
-#     _updateNodeColors(upd);
-#     const connectedEdges = network.getConnectedEdges(nodeId) || [];
-#     const edgeUpdates = connectedEdges.map(eid => {{
-#         try {{
-#             const ed = network.body.data.edges.get(eid);
-#             if(ed) {{ return {{id: eid, width: (ed.width||1) + 3}}; }}
-#         }} catch(e){{}}
-#         return null;
-#     }}).filter(x=>x);
-#     try {{ network.body.data.edges.update(edgeUpdates); }} catch(e) {{}}
-#     if (!permanentHighlight) {{
-#         setTimeout(()=> {{
-#             const restoreNodes = Object.keys(original).map(id => {{
-#                 const orig = original[id];
-#                 if(orig) return {{id: id, color: {{background: orig}}}};
-#                 return {{id: id}};
-#             }});
-#             try {{ network.body.data.nodes.update(restoreNodes); }} catch(e){{}}
-#             try {{ network.redraw(); }} catch(e){{}}
-#         }}, {DURATION});
-#     }}
-# }}
-# network.on("click", function(params) {{
-#     if (params.nodes.length > 0) {{
-#         const clickedNode = params.nodes[0];
-#         try {{ highlightPath(clickedNode); }} catch(e) {{}}
-#         window.parent.postMessage({{type: "iam_node_click", node: clickedNode}}, "*");
-#         try {{ localStorage.setItem("iam_last_node", clickedNode); }} catch(e){{}}
-#     }}
-# }});
-# try {{
-#     const lastNode = localStorage.getItem("iam_last_node");
-#     if (lastNode) {{
-#         setTimeout(() => {{ try {{ highlightPath(lastNode); }} catch(e){{}} }}, 800);
-#     }}
-# }} catch(e){{}}
-# </script>
-# """.format(COLOR=highlight_color, DURATION=int(highlight_duration))
-
-#     # inject overlays + highlight script
-#     html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-#     html_str = re.sub(r"(</body>)", highlight_js + r"\\1", html_str, flags=re.IGNORECASE)
-
-#     clicked_node = None
-#     return G, html_str, clicked_node
-
-
-
-# # ================== EXTRA HELPERS ==================
-# def export_graph_json(G, path="graph.json"):
-#     """Export NetworkX graph to JSON file."""
-#     data = {
-#         "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-#         "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
-#     }
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, indent=2)
-#     return path
-
-# def compute_keep_set_from_diff(snapshot):
-#     """
-#     Extract set of entities (names) that are added/modified in diff.
-#     """
-#     d = snapshot.get("_meta", {}).get("diff", {}) or {}
-#     keep = set()
-#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"), ("roles", "RoleName"), ("policies", "PolicyName")]:
-#         ent_diff = d.get(ent, {})
-#         for n in ent_diff.get("added", []) + ent_diff.get("modified", []):
-#             if n:
-#                 keep.add(n)
-#     return keep
-
-# def build_adjacency(G, node):
-#     """
-#     Return predecessors and successors of a node.
-#     """
-#     preds = sorted([n for n in G.predecessors(node)]) if hasattr(G, "predecessors") else []
-#     succs = sorted([n for n in G.successors(node)]) if hasattr(G, "successors") else []
-#     return preds, succs
 
 # core/graph_builder.py
-import networkx as nx
-from pyvis.network import Network
-import tempfile
+# """
+# Safe, trimmed IAM graph builder for IAM X-Ray v0.1.0-beta.
+
+# - Filters AWS-managed policies & service-linked roles early to avoid explosion.
+# - Caps default graph size via MAX_NODES and preserves changed/risky nodes from snapshot diff.
+# - Lightweight policy analysis for risk-highlighting.
+# - Maintains compatibility with previous API:
+#     build_graph(snapshot, show_only_risky=False) -> networkx.DiGraph
+#     build_iam_graph(snapshot, ...) -> (G, html_str, clicked_node, export_bytes)
+#     search_permissions(G, query) -> dict
+# """
+# import os
+# import re
+# import json
+# import tempfile
+# import logging
+# from datetime import datetime, timedelta
+
+# import networkx as nx
+# from pyvis.network import Network
+
+# # Try to import secure_store (some versions provide decrypt_and_read)
+# from core import secure_store
+
+# logger = logging.getLogger("graph_builder")
+# logger.setLevel(logging.INFO)
+# if not logger.handlers:
+#     ch = logging.StreamHandler()
+#     ch.setLevel(logging.INFO)
+#     logger.addHandler(ch)
+
+# # Colors used in UI
+# NODE_COLORS = {
+#     "user": "#3B82F6",
+#     "group": "#F59E0B",
+#     "role": "#10B981",
+#     "policy": "#6B7280",
+#     "principal": "#9CA3AF",
+# }
+
+# # Safety limits for beta
+# MAX_NODES = 200            # target cap for interactive graph
+# CLUSTER_THRESHOLD = 600    # not used aggressively in beta
+
+# # AWS-managed/service-linked detection
+# AWS_MANAGED_PREFIX = "arn:aws:iam::aws:policy/"
+# AWS_SERVICE_ROLE_PATTERNS = [r"AWSServiceRoleFor", r"^aws-service-role/"]
+# AWS_DEFAULT_ROLE_NAMES = ["OrganizationAccountAccessRole"]
+
+# # Risk patterns for light analyzer
+
+# RISKY_PATTERNS = [
+#     r"\*",
+#     r"iam:PassRole",
+#     r"sts:AssumeRole",
+# ]
+
+# # ================= REAL WORLD DANGEROUS IAM ACTIONS (2025 EDITION) =================
+# DANGEROUS_ACTIONS = {
+#     # Privilege Escalation Goldmine
+#     "iam:CreatePolicy": "Can create any policy",
+#     "iam:CreatePolicyVersion": "Can overwrite existing policies",
+#     "iam:SetDefaultPolicyVersion": "Can activate malicious version",
+#     "iam:AttachUserPolicy": "Can attach policy to any user",
+#     "iam:AttachGroupPolicy": "Can attach policy to group",
+#     "iam:AttachRolePolicy": "Can attach policy to role",
+#     "iam:PutUserPolicy": "Inline policy on user",
+#     "iam:PutGroupPolicy": "Inline policy on group",
+#     "iam:PutRolePolicy": "Inline policy on role",
+#     "iam:UpdateAssumeRolePolicy": "Can modify trust policy",
+#     "iam:PassRole": "Can pass role to any service",
+
+#     # STS AssumeRole Bombs
+#     "sts:AssumeRole": "Can assume any role",
+
+#     # Full Control Plane Destruction
+#     "ec2:RunInstances": "Can launch EC2 with any role",
+#     "lambda:CreateFunction": "Can create Lambda",
+#     "lambda:InvokeFunction": "Can trigger Lambda",
+#     "lambda:UpdateFunctionCode": "Can modify Lambda code",
+
+#     # Data Exfil
+#     "s3:GetObject": "Can read S3 files",
+#     "s3:ListBucket": "Can list S3 bucket",
+#     "secretsmanager:GetSecretValue": "Can read secrets",
+#     "ssm:GetParameter": "Can read SSM parameters",
+
+#     # Persistence
+#     "iam:CreateAccessKey": "Can create access keys",
+#     "iam:CreateLoginProfile": "Can set console password",
+
+#     # Wildcards (Nuclear)
+#     "*": "Full admin via wildcard",
+# }
+
+
+# # HIGH-RISK (Orange-Red) — Real threats, but not panic
+# HIGH_RISK_ACTIONS = {
+#     "iam:CreatePolicy",
+#     "iam:CreatePolicyVersion",
+#     "iam:SetDefaultPolicyVersion",
+#     "iam:AttachUserPolicy",
+#     "iam:AttachGroupPolicy",
+#     "iam:AttachRolePolicy",
+#     "iam:PutUserPolicy",
+#     "iam:PutGroupPolicy",
+#     "iam:PutRolePolicy",
+#     "iam:UpdateAssumeRolePolicy",
+#     "iam:PassRole",
+#     "sts:AssumeRole",
+#     "iam:CreateAccessKey",
+#     "iam:CreateLoginProfile",
+# }
+
+# # MEDIUM-RISK (Yellow-Orange) — Wildcards & broad access
+# MEDIUM_RISK_PATTERNS = [
+#     r"\*$",           # Ends with *
+#     r":\*$",          # service:*
+#     r"^\*$",          # Full wildcard
+# ]
+
+# def load_snapshot(path):
+#     """
+#     Load IAM snapshot - supports encrypted (.enc) and plaintext (.json).
+#     Tries secure_store.decrypt_and_read or secure_store.read_and_decrypt if present.
+#     """
+#     if not path or not os.path.exists(path):
+#         raise FileNotFoundError(f"Snapshot not found: {path}")
+#     # prefer secure_store.decrypt_and_read
+#     try:
+#         if hasattr(secure_store, "decrypt_and_read"):
+#             return secure_store.decrypt_and_read(path)
+#         if hasattr(secure_store, "read_and_decrypt"):
+#             return secure_store.read_and_decrypt(path)
+#     except Exception as e:
+#         logger.debug(f"secure_store decrypt/read failed: {e}. Trying plaintext fallback.")
+
+#     # plaintext fallback
+#     with open(path, "r", encoding="utf-8") as f:
+#         return json.load(f)
+
+
+# # ------------------- Lightweight policy analyzer ---------------------
+# def _ensure_list(x):
+#     if x is None:
+#         return []
+#     if isinstance(x, list):
+#         return x
+#     return [x]
+
+
+# def _lightweight_policy_findings(doc):
+#     """
+#     Minimal, fast checks:
+#       - action/resource wildcard
+#       - iam:PassRole, sts:AssumeRole
+#     Returns list of finding dicts.
+#     """
+#     findings = []
+#     if not isinstance(doc, dict):
+#         return findings
+#     stmts = doc.get("Statement", [])
+#     if isinstance(stmts, dict):
+#         stmts = [stmts]
+#     for idx, stmt in enumerate(stmts):
+#         actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#         resources = _ensure_list(stmt.get("Resource"))
+#         for a in actions:
+#             if not isinstance(a, str):
+#                 continue
+#             al = a.lower()
+#             if al == "*" or "*" in al:
+#                 findings.append({"code": "ACTION_WILDCARD", "message": f"Action wildcard: {a}"})
+#             if al in ("iam:passrole", "sts:assumerole"):
+#                 findings.append({"code": "SENSITIVE_ACTION", "message": f"Sensitive action: {a}"})
+#         for r in resources:
+#             if isinstance(r, str) and r.strip() == "*":
+#                 findings.append({"code": "RESOURCE_WILDCARD", "message": "Resource '*' used"})
+#     return findings
+
+
+# # ------------------- Helpers to detect AWS-managed/service roles ---------------------
+# def _is_aws_managed_policy(p):
+#     arn = (p or {}).get("Arn") or ""
+#     name = (p or {}).get("PolicyName") or ""
+#     if isinstance(arn, str) and arn.startswith(AWS_MANAGED_PREFIX):
+#         return True
+#     # also catch obvious patterns
+#     if isinstance(name, str) and (name.startswith("AWS") or "Amazon" in name):
+#         # conservative: only skip if clearly AWS-managed naming
+#         if "Managed" in name or "AWS" in name:
+#             return True
+#     return False
+
+
+# def _is_service_linked_role(r):
+#     name = (r or {}).get("RoleName") or ""
+#     if not name:
+#         return False
+#     for pat in AWS_SERVICE_ROLE_PATTERNS:
+#         if re.search(pat, name, flags=re.IGNORECASE):
+#             return True
+#     if name in AWS_DEFAULT_ROLE_NAMES:
+#         return True
+#     return False
+
+
+# # ------------------- Diff-based keep set ---------------------
+# def compute_keep_set_from_diff(snapshot):
+#     """Return set of entity names that are added/modified (for all entity types)."""
+#     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
+#     keep = set()
+#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"),
+#                           ("roles", "RoleName"), ("policies", "PolicyName")]:
+#         ent_diff = d.get(ent, {}) or {}
+#         for n in (ent_diff.get("added", []) or []) + (ent_diff.get("modified", []) or []):
+#             if n:
+#                 keep.add(n)
+#     return keep
+
+
+# # ------------------- Build adjacency helper ---------------------
+# def build_adjacency(G):
+#     """Return {node: {incoming: [...], outgoing: [...]}} for a networkx graph."""
+#     adj = {}
+#     for n in G.nodes:
+#         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
+#         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
+#         adj[n] = {"incoming": incoming, "outgoing": outgoing}
+#     return adj
+
+
+# def export_graph_json(G, path="graph.json"):
+#     """Export a compact nodes/edges JSON for download/debug."""
+#     data = {
+#         "nodes": [{"id": n, **dict(G.nodes[n])} for n in G.nodes()],
+#         "edges": [{"source": u, "target": v, **(dict(e) if isinstance(e, dict) else {})} for u, v, e in G.edges(data=True)]
+#     }
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(data, f, indent=2)
+#     return path
+
+
+# # ------------------- Build trimmed graph (core fix) ---------------------
+# def build_graph(snapshot, show_only_risky=False):
+#     """
+#     Build a networkx DiGraph from snapshot with safety trimming:
+#       - Filter out AWS-managed policies and service-linked roles early.
+#       - Cap node count to MAX_NODES preserving changed/risky nodes if possible.
+#     Returns: nx.DiGraph
+#     """
+#     if not snapshot or not any(k in snapshot for k in ("users", "groups", "roles", "policies")):
+#         logger.warning("Invalid or empty snapshot data")
+#         return nx.DiGraph()
+
+#     # -- Pre-filter lists to remove heavy AWS-managed/service items --
+#     users = snapshot.get("users", []) or []
+#     groups = snapshot.get("groups", []) or []
+#     roles = snapshot.get("roles", []) or []
+#     policies = snapshot.get("policies", []) or []
+
+#     filtered_policies = []
+#     for p in policies:
+#         try:
+#             if _is_aws_managed_policy(p):
+#                 continue
+#         except Exception:
+#             # if detection fails, keep policy to be safe
+#             filtered_policies.append(p)
+#             continue
+#         filtered_policies.append(p)
+
+#     filtered_roles = []
+#     for r in roles:
+#         try:
+#             if _is_service_linked_role(r):
+#                 continue
+#         except Exception:
+#             filtered_roles.append(r)
+#             continue
+#         filtered_roles.append(r)
+
+#     # Quick counts
+#     total_entities = len(users) + len(groups) + len(filtered_roles) + len(filtered_policies)
+#     logger.info(f"Entities after AWS-managed/service-role filtering: users={len(users)}, groups={len(groups)}, roles={len(filtered_roles)}, policies={len(filtered_policies)} (total={total_entities})")
+
+#     # Decide keep set based on diff (prefer changed/risky)
+#     keep_set = compute_keep_set_from_diff(snapshot)
+
+#     # Build an ordered list of nodes (prefer keep_set and risky ones)
+#     # We'll create a set of node ids to include (strings: user names, group names, role names, policy names)
+#     node_candidates = []
+
+#     def add_candidate(name, t, score=0, risky=False):
+#         node_candidates.append({"id": name, "type": t, "score": score, "risky": risky})
+
+#     for p in filtered_policies:
+#         pname = p.get("PolicyName") or p.get("Arn")
+#         if not pname:
+#             continue
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_candidate(pname, "policy", score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     for r in filtered_roles:
+#         rname = r.get("RoleName") or r.get("Arn")
+#         if not rname:
+#             continue
+#         role_risk = bool(r.get("AssumePolicyRisk")) or bool(r.get("AssumePolicyFindings"))
+#         add_candidate(rname, "role", score=r.get("AssumePolicyRiskScore") or 0, risky=role_risk)
+
+#     for g in groups:
+#         gname = g.get("GroupName")
+#         if gname:
+#             add_candidate(gname, "group", risky=bool(g.get("IsRisky")))
+
+#     for u in users:
+#         uname = u.get("UserName")
+#         if uname:
+#             add_candidate(uname, "user", risky=bool(u.get("IsRisky")))
+
+#     # Sort candidates: keep ones from keep_set and risky first, then by score desc
+#     def candidate_sort_key(c):
+#         return (
+#             0 if c["id"] in keep_set else 1,
+#             0 if c["risky"] else 1,
+#             -int(c.get("score") or 0)
+#         )
+
+#     node_candidates_sorted = sorted(node_candidates, key=candidate_sort_key)
+
+#     # Trim to MAX_NODES
+#     chosen = node_candidates_sorted[:MAX_NODES]
+#     chosen_ids = {c["id"] for c in chosen}
+#     logger.info(f"Selected {len(chosen)} nodes (MAX_NODES={MAX_NODES}) for graph")
+
+#     # Build graph only from chosen nodes
+#     G = nx.DiGraph()
+
+#     # Add nodes (with meta) for chosen set
+#     # Helper to add node if in chosen_ids
+#     def add_node_if_chosen(id_name, kind, meta=None, risk_score=0, risky=False):
+#         if id_name in chosen_ids and not G.has_node(id_name):
+#             attrs = {"type": kind, "meta": meta or {}, "risk_score": risk_score, "risky": bool(risky)}
+#             G.add_node(id_name, **attrs)
+
+#     # Add policy nodes
+#     policy_map = { (p.get("PolicyName") or p.get("Arn")): p for p in filtered_policies if (p.get("PolicyName") or p.get("Arn")) }
+#     for pname, p in policy_map.items():
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_node_if_chosen(pname, "policy", meta=p, risk_score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     # Add role nodes and attachments
+#     role_map = { (r.get("RoleName") or r.get("Arn")): r for r in filtered_roles if (r.get("RoleName") or r.get("Arn")) }
+#     for rname, r in role_map.items():
+#         add_node_if_chosen(rname, "role", meta=r, risk_score=r.get("AssumePolicyRiskScore") or 0, risky=bool(r.get("AssumePolicyRisk")))
+#         for ap in (r.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(pname) and G.has_node(rname):
+#                     G.add_edge(rname, pname, relation="attached")
+#         for pr in (r.get("PrincipalsInfo") or []):
+#             short = (pr.get("value") or "").split("/")[-1]
+#             node_name = f"PRINC:{short}"
+#             add_node_if_chosen(node_name, "principal", meta=pr)
+#             if G.has_node(node_name) and G.has_node(rname):
+#                 G.add_edge(node_name, rname, relation="assumes")
+
+#     # Add groups and their attached policies
+#     group_map = { g.get("GroupName"): g for g in groups if g.get("GroupName") }
+#     for gname, g in group_map.items():
+#         add_node_if_chosen(gname, "group", meta=g, risky=bool(g.get("IsRisky")))
+#         for ap in (g.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(gname) and G.has_node(pname):
+#                     G.add_edge(gname, pname, relation="attached")
+
+#     # Add users, membership and attached policies
+#     user_map = { u.get("UserName"): u for u in users if u.get("UserName") }
+#     for uname, u in user_map.items():
+#         add_node_if_chosen(uname, "user", meta=u, risky=bool(u.get("IsRisky")))
+#         for gname in (u.get("Groups") or []):
+#             if G.has_node(uname) and G.has_node(gname):
+#                 G.add_edge(uname, gname, relation="member")
+#         for ap in (u.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(uname) and G.has_node(pname):
+#                     G.add_edge(uname, pname, relation="attached")
+
+#     # If show_only_risky option set, filter G down
+#     if show_only_risky:
+#         risky_nodes = [n for n, a in G.nodes(data=True) if a.get("risky")]
+#         H = G.subgraph(risky_nodes).copy()
+#         return H
+
+#     return G
+
+
+# # ------------------- Search (keeps compatibility with previous API) ---------------------
+# import difflib
+# def search_permissions(G, query):
+#     """
+#     Search who can perform a given action (lightweight), or return attached findings for an entity.
+#     Works with networkx DiGraph created by build_graph.
+#     """
+#     results = {}
+#     if not query:
+#         return results
+#     q_low = query.lower()
+#     is_regex = q_low.startswith("/")
+#     regex_pat = None
+#     if is_regex:
+#         try:
+#             regex_pat = re.compile(query[1:], re.IGNORECASE)
+#         except re.error:
+#             return {"error": "Invalid regex"}
+
+#     # If it looks like an action (contains ':') scan policy nodes
+#     if ":" in q_low:
+#         matches = []
+#         for n, attrs in G.nodes(data=True):
+#             if attrs.get("type") == "policy":
+#                 doc = (attrs.get("meta") or {}).get("Document") or {}
+#                 findings = _lightweight_policy_findings(doc)
+#                 for f in findings:
+#                     msg = f.get("message", "").lower()
+#                     if (not is_regex and q_low in msg) or (is_regex and regex_pat.search(msg)):
+#                         matches.append(n)
+#                         break
+#         who_can_do = set()
+#         for m in matches:
+#             # predecessors are entities that reference the policy
+#             if hasattr(G, "predecessors"):
+#                 try:
+#                     who_can_do.update(list(G.predecessors(m)))
+#                 except Exception:
+#                     pass
+#         results["action_search"] = {query: matches}
+#         results["who_can_do"] = list(who_can_do)
+#         return results
+
+#     # Entity search
+#     # exact match
+#     target = None
+#     for n in G.nodes:
+#         if n.lower() == q_low:
+#             target = n
+#             break
+#     if target:
+#         attrs = G.nodes[target]
+#         if attrs.get("type") == "policy":
+#             doc = (attrs.get("meta") or {}).get("Document") or {}
+#             findings = _lightweight_policy_findings(doc)
+#             results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
+#         else:
+#             attached = [s for s in G.successors(target) if G.nodes[s].get("type") == "policy"]
+#             entity_findings = {}
+#             for p in attached:
+#                 doc = (G.nodes[p].get("meta") or {}).get("Document") or {}
+#                 entity_findings[p] = _lightweight_policy_findings(doc) or [{"message": "✅ No risky actions"}]
+#             results["entity"] = dict(attrs)
+#             results["entity_attached_findings"] = entity_findings
+#         return results
+
+#     # fuzzy matches
+#     close = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.7)
+#     if close:
+#         results["fuzzy_matches"] = close
+#     return results
+
+
+# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None, highlight_color="#ffeb3b", highlight_duration=2200):
+#     """
+#     IAM X-Ray v1.0 — Beta
+#     """
+#     G = build_graph(snapshot, show_only_risky=show_only_risky)
+#     if len(G.nodes) == 0:
+#         empty_html = "<div style='text-align:center;padding:100px;font-size:24px;color:#666;'>No entities match current filters</div>"
+#         return nx.DiGraph(), empty_html, None, b"{}", {"reason": "no_matching_nodes"}
+
+#     net = Network(
+#         height="100vh",
+#         width="100%",
+#         directed=True,
+#         bgcolor="#ffffff",
+#         font_color="#1e293b"
+#     )
+
+#     net.set_options("""
+#     {
+#       "physics": {
+#         "enabled": true,
+#         "solver": "forceAtlas2Based",
+#         "forceAtlas2Based": {
+#           "gravitationalConstant": -80,
+#           "centralGravity": 0.01,
+#           "springLength": 220,
+#           "springConstant": 0.04,
+#           "damping": 0.9
+#         },
+#         "stabilization": {"iterations": 300}
+#       },
+#       "interaction": {
+#         "hover": true,
+#         "zoomView": true,
+#         "dragView": true,
+#         "navigationButtons": false
+#       },
+#       "edges": {
+#         "smooth": {"type": "cubicBezier", "roundness": 0.5},
+#         "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
+#         "font": {"size": 12, "color": "#64748b"},
+#         "color": "#94a3b8",
+#         "width": 2
+#       }
+#     }
+#     """)
+
+#     # Node colors
+#     def get_node_color(ntype, risky=False):
+#         if risky: return "#dc2626"
+#         return {
+#             "user": "#3b82f6",
+#             "group": "#f59e0b",
+#             "role": "#10b981",
+#             "policy": "#8b5cf6",
+#             "principal": "#94a3b8"
+#         }.get(ntype, "#64748b")
+
+#     # Add main entities with AWS ICONS
+#     for node, attrs in G.nodes(data=True):
+#         ntype = attrs.get("type", "unknown")
+#         title = node
+#         risky = attrs.get("risky", False)
+
+#         if ntype == "policy":
+#             title = f"Policy: {node}<br>Risk Score: {attrs.get('risk_score', 0)}"
+#         elif ntype == "role":
+#             title = f"Role: {node}<br>Can be assumed by external principals"
+#         elif ntype == "user":
+#             title = f"User: {node}"
+
+#         # AWS Console Style Icons
+#         icon = ""
+#         if ntype == "user":
+#             icon = ""      # fa-user
+#         elif ntype == "group":
+#             icon = ""      # fa-users
+#         elif ntype == "role":
+#             icon = ""      # fa-user-shield
+#         elif ntype == "policy":
+#             icon = ""      # fa-file-contract
+#         elif ntype == "principal":
+#             icon = ""      # fa-cloud
+
+#         title_html = f"<b>{node}</b><br><small>{title}</small>"
+#         if risky:
+#             title_html = f"Warning: {title_html}"
+
+#         size = 50 if risky else 45
+#         if highlight_node and highlight_node.lower() in node.lower():
+#             size += 20
+
+#         net.add_node(
+#             node,
+#             label=f"{icon}  {node}",
+#             title=title_html,
+#             color=get_node_color(ntype, risky),
+#             size=size,
+#             font={"size": 18, "face": "Amazon Ember, Arial", "color": "#1e293b"},
+#             shape="dot",
+#             borderWidth=4 if risky else 2,
+#             shadow=True
+#         )
+
+#     # Add edges
+#     for u, v, data in G.edges(data=True):
+#         rel = data.get("relation", "")
+#         label = ""
+#         color = "#64748b"
+#         dashes = False
+#         if rel == "member":
+#             label = "member of"
+#             color = "#3b82f6"
+#         elif rel == "attached":
+#             label = "has policy"
+#             color = "#8b5cf6"
+#         elif rel == "assumes":
+#             label = "can assume"
+#             color = "#10b981"
+#             dashes = True
+#         net.add_edge(u, v, label=label, color=color, dashes=dashes, width=2.5)
+
+#     # HIGH RISK ACTIONS (upar define kar diya hai)
+#     HIGH_RISK_ACTIONS = {
+#         "iam:CreatePolicy", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
+#         "iam:AttachUserPolicy", "iam:AttachGroupPolicy", "iam:AttachRolePolicy",
+#         "iam:PutUserPolicy", "iam:PutGroupPolicy", "iam:PutRolePolicy",
+#         "iam:UpdateAssumeRolePolicy", "iam:PassRole", "sts:AssumeRole",
+#         "iam:CreateAccessKey", "iam:CreateLoginProfile"
+#     }
+#     MEDIUM_RISK_PATTERNS = [r"\*$", r":\*$", r"^\*$"]
+
+#     # MAIN MAGIC: Professional Action Nodes
+#     action_counter = 0
+#     for policy_node, attrs in G.nodes(data=True):
+#         if attrs.get("type") != "policy":
+#             continue
+#         doc = (attrs.get("meta") or {}).get("Document") or {}
+#         stmts = doc.get("Statement", [])
+#         if not isinstance(stmts, list):
+#             stmts = [stmts]
+
+#         for stmt in stmts:
+#             if stmt.get("Effect") != "Allow":
+#                 continue
+#             actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#             resources = _ensure_list(stmt.get("Resource") or ["*"])
+
+#             for action in actions:
+#                 if not action:
+#                     continue
+#                 action_clean = action.strip()
+#                 if action_clean == "*":
+#                     action_clean = "* (All Actions)"
+
+#                 action_node = f"ACTION_{action_counter}_{action_clean.replace(':', '_').replace('*', 'STAR')[:50]}"
+#                 action_counter += 1
+
+#                 # Risk Detection
+#                 risk_level = "low"
+#                 risk_reason = ""
+
+#                 if any(action_clean.lower() == act.lower() for act in HIGH_RISK_ACTIONS):
+#                     risk_level = "high"
+#                     risk_reason = "Privilege Escalation / Persistence Risk"
+#                 elif any(re.search(pat, action_clean) for pat in MEDIUM_RISK_PATTERNS):
+#                     risk_level = "medium"
+#                     service = action_clean.split(":")[0].upper() if ":" in action_clean else ""
+#                     risk_reason = f"Broad {service} Access" if service else "Broad Action Wildcard"
+
+#                 # Smart Label
+#                 if action_clean == "* (All Actions)":
+#                     short_label = "ALL ACTIONS"
+#                 elif ":" in action_clean:
+#                     short_label = action_clean.split(":", 1)[1]
+#                     if short_label == "*":
+#                         short_label = action_clean.split(":")[0].upper() + ":*"
+#                 else:
+#                     short_label = action_clean
+#                 if len(short_label) > 20:
+#                     short_label = short_label[:17] + "..."
+
+#                 # AWS-Style Colors
+#                 if risk_level == "high":
+#                     node_color, border_color = "#dc2626", "#7f1d1d"
+#                     size, edge_width, edge_color = 38, 5, "#dc2626"
+#                 elif risk_level == "medium":
+#                     node_color, border_color = "#f97316", "#c2410c"
+#                     size, edge_width, edge_color = 34, 4, "#f97316"
+#                 else:
+#                     node_color, border_color = "#6366f1", "#4338ca"
+#                     size, edge_width, edge_color = 28, 2, "#4f46e5"
+
+#                 # Title
+#                 title_text = f"<b style='font-size:16px'>{action_clean}</b>"
+#                 if risk_level in ["high", "medium"]:
+#                     title_text += f"<br><span style='color:#fbbf24;font-weight:bold'>Warning: {risk_reason}</span>"
+#                 if "*" in resources or resources == ["*"]:
+#                     title_text += "<br><span style='color:#f59e0b'>Resource: * (All Resources)</span>"
+
+#                 net.add_node(
+#                     action_node,
+#                     label=short_label,
+#                     title=title_text,
+#                     color={"background": node_color, "border": border_color},
+#                     shape="box",
+#                     size=size,
+#                     font={"size": 14, "color": "white", "face": "Amazon Ember, Arial", "strokeWidth": 3, "strokeColor": "#000"},
+#                     borderWidth=3,
+#                     shadow=True
+#                 )
+
+#                 net.add_edge(policy_node, action_node, label="allows", color=edge_color, width=edge_width, dashes=(risk_level == "high"))
+
+#                 for predecessor in G.predecessors(policy_node):
+#                     if G.nodes[predecessor].get("type") in ["user", "role", "group"]:
+#                         net.add_edge(
+#                             predecessor, action_node,
+#                             label="CAN",
+#                             color=edge_color if risk_level != "low" else "#10b981",
+#                             width=edge_width if risk_level != "low" else 2,
+#                             font={"size": 14, "color": edge_color if risk_level != "low" else "#166534", "strokeWidth": 2}
+#                         )
+
+#     # Professional Legend + Font Awesome
+#     legend_html = """
+#     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+#     <div style="position:fixed;top:15px;left:15px;background:#ffffff;padding:20px 25px;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,0.1);z-index:9999;font-family:Amazon Ember,Arial,sans-serif">
+#       <h3 style="margin:0 0 12px;color:#0f172a;font-weight:bold">IAM X-Ray v1.0.0-beta</h3>
+#       <div style="font-size:14px;line-height:1.8;color:#475569">
+#         <div><span style="color:#dc2626;font-weight:bold">High Risk</span> — Escalation / Persistence</div>
+#         <div><span style="color:#f97316;font-weight:bold">Medium Risk</span> — Wildcard Permissions</div>
+#         <div><span style="color:#3b82f6">Blue</span> User • <span style="color:#f59e0b">Orange</span> Group</div>
+#         <div><span style="color:#10b981">Green</span> Role • <span style="color:#8b5cf6">Purple</span> Policy</div>
+#       </div>
+#     </div>
+#     """
+
+#     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
+#     html_path = os.path.join(tmpdir, "graph.html")
+#     net.write_html(html_path)
+#     with open(html_path, "r", encoding="utf-8") as f:
+#         html_str = f.read()
+
+#     # Inject legend & font awesome
+#     html_str = html_str.replace("<head>", "<head><meta charset='utf-8'>")
+#     html_str = html_str.replace("<body>", f"<body style='margin:0;background:#f8fafc'>{legend_html}")
+
+#     export_path = os.path.join(tempfile.gettempdir(), "iam_xray_graph.json")
+#     export_graph_json(G, export_path)
+#     with open(export_path, "rb") as f:
+#         export_bytes = f.read()
+
+#     return G, html_str, None, export_bytes, None
+
+
+
+
+# core/graph_builder.py
+# """
+# Safe, trimmed IAM graph builder for IAM X-Ray v0.1.0-beta.
+
+# - Filters AWS-managed policies & service-linked roles early to avoid explosion.
+# - Caps default graph size via MAX_NODES and preserves changed/risky nodes from snapshot diff.
+# - Lightweight policy analysis for risk-highlighting.
+# - Maintains compatibility with previous API:
+#     build_graph(snapshot, show_only_risky=False) -> networkx.DiGraph
+#     build_iam_graph(snapshot, ...) -> (G, html_str, clicked_node, export_bytes)
+#     search_permissions(G, query) -> dict
+# """
+# import os
+# import re
+# import json
+# import tempfile
+# import logging
+# import random  # for potential sampling
+# from datetime import datetime, timedelta
+
+# import networkx as nx
+# from pyvis.network import Network
+
+# # Try to import secure_store (some versions provide decrypt_and_read)
+# from core import secure_store
+
+# logger = logging.getLogger("graph_builder")
+# logger.setLevel(logging.INFO)
+# if not logger.handlers:
+#     ch = logging.StreamHandler()
+#     ch.setLevel(logging.INFO)
+#     logger.addHandler(ch)
+
+# # Colors used in UI
+# NODE_COLORS = {
+#     "user": "#3B82F6",
+#     "group": "#F59E0B",
+#     "role": "#10B981",
+#     "policy": "#6B7280",
+#     "principal": "#9CA3AF",
+# }
+
+# # Safety limits for beta
+# MAX_NODES = 200            # target cap for interactive graph
+# CLUSTER_THRESHOLD = 600    # not used aggressively in beta
+# MAX_ADDITIONAL_NODES = 300 # new: cap on action/service/resource nodes to prevent large graph failures
+
+# # AWS-managed/service-linked detection
+# AWS_MANAGED_PREFIX = "arn:aws:iam::aws:policy/"
+# AWS_SERVICE_ROLE_PATTERNS = [r"AWSServiceRoleFor", r"^aws-service-role/"]
+# AWS_DEFAULT_ROLE_NAMES = ["OrganizationAccountAccessRole"]
+
+# # Risk patterns for light analyzer
+# RISKY_PATTERNS = [
+#     r"\*",
+#     r"iam:PassRole",
+#     r"sts:AssumeRole",
+# ]
+
+# # ================= REAL WORLD DANGEROUS IAM ACTIONS (2025 EDITION) =================
+# DANGEROUS_ACTIONS = {
+#     # Privilege Escalation Goldmine
+#     "iam:CreatePolicy": "Creates a new IAM policy, potentially granting broad permissions.",
+#     "iam:CreatePolicyVersion": "Overwrites policy versions, allowing modification of existing permissions.",
+#     "iam:SetDefaultPolicyVersion": "Activates a specific policy version, possibly reverting to risky settings.",
+#     "iam:AttachUserPolicy": "Attaches policy to user, granting new permissions.",
+#     "iam:AttachGroupPolicy": "Attaches policy to group, affecting multiple users.",
+#     "iam:AttachRolePolicy": "Attaches policy to role, enabling service access.",
+#     "iam:PutUserPolicy": "Adds inline policy to user, customizing permissions.",
+#     "iam:PutGroupPolicy": "Adds inline policy to group, customizing group permissions.",
+#     "iam:PutRolePolicy": "Adds inline policy to role, customizing role permissions.",
+#     "iam:UpdateAssumeRolePolicy": "Modifies role trust policy, changing who can assume the role.",
+#     "iam:PassRole": "Passes role to services, potentially escalating privileges.",
+#     "sts:AssumeRole": "Assumes another role, switching identities with its permissions.",
+#     "iam:CreateAccessKey": "Creates long-term access keys, risking credential exposure.",
+#     "iam:CreateLoginProfile": "Sets console password, enabling console access.",
+#     # Full Control
+#     "ec2:RunInstances": "Launches new EC2 instances, potentially with attached roles.",
+#     "lambda:CreateFunction": "Creates new Lambda functions, executing code.",
+#     "lambda:InvokeFunction": "Triggers Lambda execution, running code.",
+#     "lambda:UpdateFunctionCode": "Updates Lambda code, modifying behavior.",
+#     # Data Exfil
+#     "s3:GetObject": "Downloads objects from S3, accessing data.",
+#     "s3:ListBucket": "Lists S3 bucket contents, discovering objects.",
+#     "secretsmanager:GetSecretValue": "Retrieves secrets, exposing sensitive data.",
+#     "ssm:GetParameter": "Retrieves SSM parameters, accessing configs.",
+#     # Wildcards
+#     "*": "Grants full access, equivalent to Administrator.",
+#     "s3:*": "Full S3 access, including delete and put.",
+#     "ec2:*": "Full EC2 control, including terminate.",
+#     # Add more common
+#     "ec2:TerminateInstances": "Permanently deletes EC2 instances.",
+#     "s3:DeleteObject": "Deletes S3 objects, causing data loss.",
+#     "iam:*": "Full IAM control, high escalation risk.",
+# }
+
+# # HIGH-RISK actions as set for fast lookup (lowercase)
+# HIGH_RISK_ACTIONS = set(act.lower() for act in [
+#     "iam:createpolicy", "iam:createpolicyversion", "iam:setdefaultpolicyversion",
+#     "iam:attachuserpolicy", "iam:attachgrouppolicy", "iam:attachrolepolicy",
+#     "iam:putuserpolicy", "iam:putgrouppolicy", "iam:putrolepolicy",
+#     "iam:updateassumerolepolicy", "iam:passrole", "sts:assumerole",
+#     "iam:createaccesskey", "iam:createloginprofile",
+#     # Add destructive
+#     "ec2:terminateinstances", "s3:deletebucket", "rds:deletedbinstance",
+# ])
+
+# # MEDIUM-RISK patterns
+# MEDIUM_RISK_PATTERNS = [
+#     r"\*$",  # ends with *
+#     r":\*$", # service:*
+#     r"^\*$", # *
+# ]
+
+# # LOW-RISK examples (for classification)
+# LOW_RISK_ACTIONS = set(act.lower() for act in [
+#     "ec2:describeinstances", "s3:listbucket", "iam:listpolicies",
+#     "logs:describelogstreams", "cloudtrail:describetrails",
+# ])
+
+# def load_snapshot(path):
+#     """
+#     Load IAM snapshot - supports encrypted (.enc) and plaintext (.json).
+#     Tries secure_store.decrypt_and_read or secure_store.read_and_decrypt if present.
+#     """
+#     if not path or not os.path.exists(path):
+#         raise FileNotFoundError(f"Snapshot not found: {path}")
+#     # prefer secure_store.decrypt_and_read
+#     try:
+#         if hasattr(secure_store, "decrypt_and_read"):
+#             return secure_store.decrypt_and_read(path)
+#         if hasattr(secure_store, "read_and_decrypt"):
+#             return secure_store.read_and_decrypt(path)
+#     except Exception as e:
+#         logger.debug(f"secure_store decrypt/read failed: {e}. Trying plaintext fallback.")
+
+#     # plaintext fallback
+#     with open(path, "r", encoding="utf-8") as f:
+#         return json.load(f)
+
+
+# # ------------------- Lightweight policy analyzer ---------------------
+# def _ensure_list(x):
+#     if x is None:
+#         return []
+#     if isinstance(x, list):
+#         return x
+#     return [x]
+
+
+# def _lightweight_policy_findings(doc):
+#     """
+#     Minimal, fast checks:
+#       - action/resource wildcard
+#       - iam:PassRole, sts:AssumeRole
+#     Returns list of finding dicts.
+#     """
+#     findings = []
+#     if not isinstance(doc, dict):
+#         return findings
+#     stmts = doc.get("Statement", [])
+#     if isinstance(stmts, dict):
+#         stmts = [stmts]
+#     for idx, stmt in enumerate(stmts):
+#         effect = stmt.get("Effect", "Allow").lower()
+#         actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#         resources = _ensure_list(stmt.get("Resource"))
+#         for a in actions:
+#             if not isinstance(a, str):
+#                 continue
+#             al = a.lower()
+#             if al == "*" or "*" in al:
+#                 findings.append({"code": "ACTION_WILDCARD", "message": f"Action wildcard: {a}", "effect": effect})
+#             if al in ("iam:passrole", "sts:assumerole"):
+#                 findings.append({"code": "SENSITIVE_ACTION", "message": f"Sensitive action: {a}", "effect": effect})
+#         for r in resources:
+#             if isinstance(r, str) and r.strip() == "*":
+#                 findings.append({"code": "RESOURCE_WILDCARD", "message": "Resource '*' used", "effect": effect})
+#     return findings
+
+
+# # ------------------- Helpers to detect AWS-managed/service roles ---------------------
+# def _is_aws_managed_policy(p):
+#     arn = (p or {}).get("Arn") or ""
+#     name = (p or {}).get("PolicyName") or ""
+#     if isinstance(arn, str) and arn.startswith(AWS_MANAGED_PREFIX):
+#         return True
+#     # also catch obvious patterns
+#     if isinstance(name, str) and (name.startswith("AWS") or "Amazon" in name):
+#         # conservative: only skip if clearly AWS-managed naming
+#         if "Managed" in name or "AWS" in name:
+#             return True
+#     return False
+
+
+# def _is_service_linked_role(r):
+#     name = (r or {}).get("RoleName") or ""
+#     if not name:
+#         return False
+#     for pat in AWS_SERVICE_ROLE_PATTERNS:
+#         if re.search(pat, name, flags=re.IGNORECASE):
+#             return True
+#     if name in AWS_DEFAULT_ROLE_NAMES:
+#         return True
+#     return False
+
+
+# # ------------------- Diff-based keep set ---------------------
+# def compute_keep_set_from_diff(snapshot):
+#     """Return set of entity names that are added/modified (for all entity types)."""
+#     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
+#     keep = set()
+#     for ent, key_name in [("users", "UserName"), ("groups", "GroupName"),
+#                           ("roles", "RoleName"), ("policies", "PolicyName")]:
+#         ent_diff = d.get(ent, {}) or {}
+#         for n in (ent_diff.get("added", []) or []) + (ent_diff.get("modified", []) or []):
+#             if n:
+#                 keep.add(n)
+#     return keep
+
+
+# # ------------------- Build adjacency helper ---------------------
+# def build_adjacency(G):
+#     """Return {node: {incoming: [...], outgoing: [...]}} for a networkx graph."""
+#     adj = {}
+#     for n in G.nodes:
+#         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
+#         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
+#         adj[n] = {"incoming": incoming, "outgoing": outgoing}
+#     return adj
+
+
+# def export_graph_json(G, path="graph.json"):
+#     """Export a compact nodes/edges JSON for download/debug."""
+#     data = {
+#         "nodes": [{"id": n, **dict(G.nodes[n])} for n in G.nodes()],
+#         "edges": [{"source": u, "target": v, **(dict(e) if isinstance(e, dict) else {})} for u, v, e in G.edges(data=True)]
+#     }
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(data, f, indent=2)
+#     return path
+
+
+# # ------------------- Build trimmed graph (core fix) ---------------------
+# def build_graph(snapshot, show_only_risky=False):
+#     """
+#     Build a networkx DiGraph from snapshot with safety trimming:
+#       - Filter out AWS-managed policies and service-linked roles early.
+#       - Cap node count to MAX_NODES preserving changed/risky nodes if possible.
+#     Returns: nx.DiGraph
+#     """
+#     if not snapshot or not any(k in snapshot for k in ("users", "groups", "roles", "policies")):
+#         logger.warning("Invalid or empty snapshot data")
+#         return nx.DiGraph()
+
+#     # -- Pre-filter lists to remove heavy AWS-managed/service items --
+#     users = snapshot.get("users", []) or []
+#     groups = snapshot.get("groups", []) or []
+#     roles = snapshot.get("roles", []) or []
+#     policies = snapshot.get("policies", []) or []
+
+#     filtered_policies = []
+#     for p in policies:
+#         try:
+#             if _is_aws_managed_policy(p):
+#                 continue
+#         except Exception:
+#             # if detection fails, keep policy to be safe
+#             filtered_policies.append(p)
+#             continue
+#         filtered_policies.append(p)
+
+#     filtered_roles = []
+#     for r in roles:
+#         try:
+#             if _is_service_linked_role(r):
+#                 continue
+#         except Exception:
+#             filtered_roles.append(r)
+#             continue
+#         filtered_roles.append(r)
+
+#     # Quick counts
+#     total_entities = len(users) + len(groups) + len(filtered_roles) + len(filtered_policies)
+#     logger.info(f"Entities after AWS-managed/service-role filtering: users={len(users)}, groups={len(groups)}, roles={len(filtered_roles)}, policies={len(filtered_policies)} (total={total_entities})")
+
+#     # Decide keep set based on diff (prefer changed/risky)
+#     keep_set = compute_keep_set_from_diff(snapshot)
+
+#     # Build an ordered list of nodes (prefer keep_set and risky ones)
+#     # We'll create a set of node ids to include (strings: user names, group names, role names, policy names)
+#     node_candidates = []
+
+#     def add_candidate(name, t, score=0, risky=False):
+#         node_candidates.append({"id": name, "type": t, "score": score, "risky": risky})
+
+#     for p in filtered_policies:
+#         pname = p.get("PolicyName") or p.get("Arn")
+#         if not pname:
+#             continue
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_candidate(pname, "policy", score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     for r in filtered_roles:
+#         rname = r.get("RoleName") or r.get("Arn")
+#         if not rname:
+#             continue
+#         role_risk = bool(r.get("AssumePolicyRisk")) or bool(r.get("AssumePolicyFindings"))
+#         add_candidate(rname, "role", score=r.get("AssumePolicyRiskScore") or 0, risky=role_risk)
+
+#     for g in groups:
+#         gname = g.get("GroupName")
+#         if gname:
+#             add_candidate(gname, "group", risky=bool(g.get("IsRisky")))
+
+#     for u in users:
+#         uname = u.get("UserName")
+#         if uname:
+#             add_candidate(uname, "user", risky=bool(u.get("IsRisky")))
+
+#     # Sort candidates: keep ones from keep_set and risky first, then by score desc
+#     def candidate_sort_key(c):
+#         return (
+#             0 if c["id"] in keep_set else 1,
+#             0 if c["risky"] else 1,
+#             -int(c.get("score") or 0)
+#         )
+
+#     node_candidates_sorted = sorted(node_candidates, key=candidate_sort_key)
+
+#     # Trim to MAX_NODES
+#     chosen = node_candidates_sorted[:MAX_NODES]
+#     chosen_ids = {c["id"] for c in chosen}
+#     logger.info(f"Selected {len(chosen)} nodes (MAX_NODES={MAX_NODES}) for graph")
+
+#     # Build graph only from chosen nodes
+#     G = nx.DiGraph()
+
+#     # Add nodes (with meta) for chosen set
+#     # Helper to add node if in chosen_ids
+#     def add_node_if_chosen(id_name, kind, meta=None, risk_score=0, risky=False):
+#         if id_name in chosen_ids and not G.has_node(id_name):
+#             attrs = {"type": kind, "meta": meta or {}, "risk_score": risk_score, "risky": bool(risky)}
+#             G.add_node(id_name, **attrs)
+
+#     # Add policy nodes
+#     policy_map = { (p.get("PolicyName") or p.get("Arn")): p for p in filtered_policies if (p.get("PolicyName") or p.get("Arn")) }
+#     for pname, p in policy_map.items():
+#         is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+#         add_node_if_chosen(pname, "policy", meta=p, risk_score=p.get("RiskScore") or 0, risky=is_risky)
+
+#     # Add role nodes and attachments
+#     role_map = { (r.get("RoleName") or r.get("Arn")): r for r in filtered_roles if (r.get("RoleName") or r.get("Arn")) }
+#     for rname, r in role_map.items():
+#         add_node_if_chosen(rname, "role", meta=r, risk_score=r.get("AssumePolicyRiskScore") or 0, risky=bool(r.get("AssumePolicyRisk")))
+#         for ap in (r.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(pname) and G.has_node(rname):
+#                     G.add_edge(rname, pname, relation="attached")
+#         for pr in (r.get("PrincipalsInfo") or []):
+#             short = (pr.get("value") or "").split("/")[-1]
+#             node_name = f"PRINC:{short}"
+#             add_node_if_chosen(node_name, "principal", meta=pr)
+#             if G.has_node(node_name) and G.has_node(rname):
+#                 G.add_edge(node_name, rname, relation="assumes")
+
+#     # Add groups and their attached policies
+#     group_map = { g.get("GroupName"): g for g in groups if g.get("GroupName") }
+#     for gname, g in group_map.items():
+#         add_node_if_chosen(gname, "group", meta=g, risky=bool(g.get("IsRisky")))
+#         for ap in (g.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(gname) and G.has_node(pname):
+#                     G.add_edge(gname, pname, relation="attached")
+
+#     # Add users, membership and attached policies
+#     user_map = { u.get("UserName"): u for u in users if u.get("UserName") }
+#     for uname, u in user_map.items():
+#         add_node_if_chosen(uname, "user", meta=u, risky=bool(u.get("IsRisky")))
+#         for gname in (u.get("Groups") or []):
+#             if G.has_node(uname) and G.has_node(gname):
+#                 G.add_edge(uname, gname, relation="member")
+#         for ap in (u.get("AttachedPolicies") or []):
+#             pname = ap.get("PolicyName")
+#             if pname:
+#                 add_node_if_chosen(pname, "policy")
+#                 if G.has_node(uname) and G.has_node(pname):
+#                     G.add_edge(uname, pname, relation="attached")
+
+#     # If show_only_risky option set, filter G down
+#     if show_only_risky:
+#         risky_nodes = [n for n, a in G.nodes(data=True) if a.get("risky")]
+#         H = G.subgraph(risky_nodes).copy()
+#         return H
+
+#     return G
+
+
+# # ------------------- Search (keeps compatibility with previous API) ---------------------
+# import difflib
+# def search_permissions(G, query):
+#     """
+#     Search who can perform a given action (lightweight), or return attached findings for an entity.
+#     Works with networkx DiGraph created by build_graph.
+#     """
+#     results = {}
+#     if not query:
+#         return results
+#     q_low = query.lower()
+#     is_regex = q_low.startswith("/")
+#     regex_pat = None
+#     if is_regex:
+#         try:
+#             regex_pat = re.compile(query[1:], re.IGNORECASE)
+#         except re.error:
+#             return {"error": "Invalid regex"}
+
+#     # If it looks like an action (contains ':') scan policy nodes
+#     if ":" in q_low:
+#         matches = []
+#         for n, attrs in G.nodes(data=True):
+#             if attrs.get("type") == "policy":
+#                 doc = (attrs.get("meta") or {}).get("Document") or {}
+#                 findings = _lightweight_policy_findings(doc)
+#                 for f in findings:
+#                     msg = f.get("message", "").lower()
+#                     if (not is_regex and q_low in msg) or (is_regex and regex_pat.search(msg)):
+#                         matches.append(n)
+#                         break
+#         who_can_do = set()
+#         for m in matches:
+#             # predecessors are entities that reference the policy
+#             if hasattr(G, "predecessors"):
+#                 try:
+#                     who_can_do.update(list(G.predecessors(m)))
+#                 except Exception:
+#                     pass
+#         results["action_search"] = {query: matches}
+#         results["who_can_do"] = list(who_can_do)
+#         return results
+
+#     # Entity search
+#     # exact match
+#     target = None
+#     for n in G.nodes:
+#         if n.lower() == q_low:
+#             target = n
+#             break
+#     if target:
+#         attrs = G.nodes[target]
+#         if attrs.get("type") == "policy":
+#             doc = (attrs.get("meta") or {}).get("Document") or {}
+#             findings = _lightweight_policy_findings(doc)
+#             results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
+#         else:
+#             attached = [s for s in G.successors(target) if G.nodes[s].get("type") == "policy"]
+#             entity_findings = {}
+#             for p in attached:
+#                 doc = (G.nodes[p].get("meta") or {}).get("Document") or {}
+#                 entity_findings[p] = _lightweight_policy_findings(doc) or [{"message": "✅ No risky actions"}]
+#             results["entity"] = dict(attrs)
+#             results["entity_attached_findings"] = entity_findings
+#         return results
+
+#     # fuzzy matches
+#     close = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.7)
+#     if close:
+#         results["fuzzy_matches"] = close
+#     return results
+
+
+# def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None, highlight_color="#ffeb3b", highlight_duration=2200):
+#     """
+#     IAM X-Ray v1.0 — Beta
+#     """
+#     G = build_graph(snapshot, show_only_risky=show_only_risky)
+#     if len(G.nodes) == 0:
+#         empty_html = "<div style='text-align:center;padding:100px;font-size:24px;color:#666;'>No entities match current filters</div>"
+#         return nx.DiGraph(), empty_html, None, b"{}", {"reason": "no_matching_nodes"}
+
+#     net = Network(
+#         height="100vh",
+#         width="100%",
+#         directed=True,
+#         bgcolor="#ffffff",
+#         font_color="#1e293b"
+#     )
+
+#     net.set_options("""
+#     {
+#       "physics": {
+#         "enabled": true,
+#         "solver": "forceAtlas2Based",
+#         "forceAtlas2Based": {
+#           "gravitationalConstant": -80,
+#           "centralGravity": 0.01,
+#           "springLength": 220,
+#           "springConstant": 0.04,
+#           "damping": 0.9
+#         },
+#         "stabilization": {"iterations": 300}
+#       },
+#       "interaction": {
+#         "hover": true,
+#         "zoomView": true,
+#         "dragView": true,
+#         "navigationButtons": false
+#       },
+#       "edges": {
+#         "smooth": {"type": "cubicBezier", "roundness": 0.5},
+#         "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
+#         "font": {"size": 12, "color": "#64748b"},
+#         "color": "#94a3b8",
+#         "width": 2
+#       }
+#     }
+#     """)
+
+#     # Node colors
+#     def get_node_color(ntype, risky=False):
+#         if risky: return "#dc2626"
+#         return {
+#             "user": "#3b82f6",
+#             "group": "#f59e0b",
+#             "role": "#10b981",
+#             "policy": "#8b5cf6",
+#             "principal": "#94a3b8"
+#         }.get(ntype, "#64748b")
+
+#     # Add main entities with AWS ICONS
+#     for node, attrs in G.nodes(data=True):
+#         ntype = attrs.get("type", "unknown")
+#         title = node
+#         risky = attrs.get("risky", False)
+
+#         if ntype == "policy":
+#             title = f"Policy: {node}<br>Risk Score: {attrs.get('risk_score', 0)}<br>Attached to: {', '.join(G.predecessors(node)) or 'None'}"
+#         elif ntype == "role":
+#             title = f"Role: {node}<br>Can be assumed by: {', '.join(G.predecessors(node)) or 'None'}<br>Policies: {', '.join(G.successors(node)) or 'None'}"
+#         elif ntype == "group":
+#             title = f"Group: {node}<br>Members: {', '.join(G.predecessors(node)) or 'None'}<br>Policies: {', '.join(G.successors(node)) or 'None'}"
+#         elif ntype == "user":
+#             title = f"User: {node}<br>Groups: {', '.join(G.successors(node)) or 'None'}<br>Policies: {', '.join([s for s in G.successors(node) if G.nodes[s]['type'] == 'policy']) or 'None'}"
+
+#         # AWS Console Style Icons
+#         icon = ""
+#         if ntype == "user":
+#             icon = ""      # fa-user
+#         elif ntype == "group":
+#             icon = ""      # fa-users
+#         elif ntype == "role":
+#             icon = ""      # fa-user-shield
+#         elif ntype == "policy":
+#             icon = ""      # fa-file-contract
+#         elif ntype == "principal":
+#             icon = ""      # fa-cloud
+
+#         title_html = f"<b>{node}</b><br><small>{title}</small>"
+#         if risky:
+#             title_html = f"Warning: {title_html}"
+
+#         size = 50 if risky else 45
+#         if highlight_node and highlight_node.lower() in node.lower():
+#             size += 20
+
+#         net.add_node(
+#             node,
+#             label=f"{icon}  {node}",
+#             title=title_html,
+#             color=get_node_color(ntype, risky),
+#             size=size,
+#             font={"size": 18, "face": "Amazon Ember, Arial", "color": "#1e293b"},
+#             shape="dot",
+#             borderWidth=4 if risky else 2,
+#             shadow=True
+#         )
+
+#     # Add edges
+#     for u, v, data in G.edges(data=True):
+#         rel = data.get("relation", "")
+#         label = ""
+#         color = "#64748b"
+#         dashes = False
+#         if rel == "member":
+#             label = "member of"
+#             color = "#3b82f6"
+#         elif rel == "attached":
+#             label = "has policy"
+#             color = "#8b5cf6"
+#         elif rel == "assumes":
+#             label = "can assume"
+#             color = "#10b981"
+#             dashes = True
+#         net.add_edge(u, v, label=label, color=color, dashes=dashes, width=2.5)
+
+#     # MAIN MAGIC: Professional Action Nodes
+#     action_counter = 0
+#     additional_nodes_count = 0
+#     for policy_node, attrs in G.nodes(data=True):
+#         if attrs.get("type") != "policy":
+#             continue
+#         doc = (attrs.get("meta") or {}).get("Document") or {}
+#         stmts = doc.get("Statement", [])
+#         if not isinstance(stmts, list):
+#             stmts = [stmts]
+
+#         for stmt in stmts:
+            
+#             effect = stmt.get("Effect", "Allow")
+#             is_deny = effect == "Deny"
+#             actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+#             resources = _ensure_list(stmt.get("Resource") or ["*"])
+
+#             for action in actions:
+#                 if additional_nodes_count > MAX_ADDITIONAL_NODES:
+#                     logger.warning("Reached max additional nodes; skipping further actions")
+#                     break
+#                 if not action:
+#                     continue
+#                 action_original = action.strip()
+#                 action_clean = action_original
+#                 if action_clean == "*":
+#                     action_clean = "* (All Actions)"
+
+#                 # Risk Detection using original action
+#                 al = action_original.lower()
+#                 risk_level = "low"
+#                 risk_reason = ""
+#                 outcome = DANGEROUS_ACTIONS.get(action_original, "Standard operation - no specific risk identified.")
+
+#                 if al in HIGH_RISK_ACTIONS:
+#                     risk_level = "high"
+#                     risk_reason = "Privilege Escalation / Persistence Risk / Destructive"
+#                 elif any(re.search(pat, al, re.IGNORECASE) for pat in MEDIUM_RISK_PATTERNS):
+#                     risk_level = "medium"
+#                     risk_reason = "Data read/write or broad access"
+#                 elif al in LOW_RISK_ACTIONS:
+#                     risk_level = "low"
+#                     risk_reason = "Listing / describe / metadata"
+#                 else:
+#                     # Default to low if not matched
+#                     risk_level = "low"
+#                     risk_reason = "Listing / describe / metadata"
+
+#                 if is_deny:
+#                     risk_level = "deny"
+#                     risk_reason = "Explicit Deny"
+#                     outcome = "Action Denied: " + outcome
+
+#                 # Skip low priority to reduce clutter and potential large graph issues
+#                 if risk_level == "low":
+#                     continue
+
+#                 # Smart Label
+#                 if action_clean == "* (All Actions)":
+#                     short_label = "ALL ACTIONS"
+#                 elif ":" in action_clean:
+#                     short_label = action_clean.split(":", 1)[1]
+#                     if short_label == "*":
+#                         short_label = action_clean.split(":")[0].upper() + ":*"
+#                 else:
+#                     short_label = action_clean
+#                 if len(short_label) > 20:
+#                     short_label = short_label[:17] + "..."
+
+#                 # AWS-Style Colors
+#                 if risk_level == "high":
+#                     node_color, border_color = "#dc2626", "#7f1d1d"
+#                     size, edge_width, edge_color = 38, 5, "#dc2626"
+#                 elif risk_level == "medium":
+#                     node_color, border_color = "#f97316", "#c2410c"
+#                     size, edge_width, edge_color = 34, 4, "#f97316"
+#                 elif risk_level == "deny":
+#                     node_color, border_color = "#ef4444", "#b91c1c"
+#                     size, edge_width, edge_color = 30, 3, "#ef4444"
+#                 else:
+#                     node_color, border_color = "#6366f1", "#4338ca"
+#                     size, edge_width, edge_color = 28, 2, "#4f46e5"
+
+#                 # Title with outcome
+#                 title_text = f"<b style='font-size:16px'>{action_clean}</b><br>Priority: {risk_level.upper()}<br>Reason: {risk_reason}<br>Outcome: {outcome}"
+#                 if "*" in ''.join(resources):
+#                     title_text += "<br>Resource: * (All Resources)"
+
+#                 action_node = f"ACTION_{action_counter}_{action_clean.replace(':', '_').replace('*', 'STAR').replace(' ', '_')[:50]}"
+#                 action_counter += 1
+#                 additional_nodes_count += 1
+
+#                 net.add_node(
+#                     action_node,
+#                     label=short_label,
+#                     title=title_text,
+#                     color={"background": node_color, "border": border_color},
+#                     shape="box",
+#                     size=size,
+#                     font={"size": 14, "color": "white", "face": "Amazon Ember, Arial", "strokeWidth": 3, "strokeColor": "#000"},
+#                     borderWidth=3,
+#                     shadow=True
+#                 )
+
+#                 edge_label = "denies" if is_deny else "allows"
+#                 net.add_edge(policy_node, action_node, label=edge_label, color=edge_color, width=edge_width, dashes=(risk_level in ["high", "deny"]))
+
+#                 for predecessor in G.predecessors(policy_node):
+#                     if G.nodes[predecessor].get("type") in ["user", "role", "group"]:
+#                         can_label = "CANNOT" if is_deny else "CAN"
+#                         net.add_edge(
+#                             predecessor, action_node,
+#                             label=can_label,
+#                             color=edge_color if risk_level != "low" else "#10b981",
+#                             width=edge_width if risk_level != "low" else 2,
+#                             font={"size": 14, "color": edge_color if risk_level != "low" else "#166534", "strokeWidth": 2},
+#                             dashes=(is_deny)
+#                         )
+
+#                 # Add service node if applicable
+#                 if ":" in action_original:
+#                     service = action_original.split(":")[0].upper()
+#                     service_node = f"SVC_{service}"
+#                     if not net.get_node(service_node):
+#                         additional_nodes_count += 1
+#                         net.add_node(
+#                             service_node,
+#                             label=service,
+#                             title=f"AWS Service: {service}<br>Accessed via: {action_clean}",
+#                             color="#a5b4fc",
+#                             shape="diamond",
+#                             size=32,
+#                             font={"size": 16, "color": "#312e81"}
+#                         )
+#                     net.add_edge(action_node, service_node, label="in", color="#6366f1", width=2)
+
+#                 # Add resource nodes (limit to 3 per action to prevent explosion)
+#                 res_list = resources[:3]
+#                 if len(resources) > 3:
+#                     res_list.append("and more...")
+#                 for res in res_list:
+#                     if additional_nodes_count > MAX_ADDITIONAL_NODES:
+#                         break
+#                     if res == "and more...":
+#                         res_clean = "MULTIPLE RESOURCES"
+#                         res_title = "Multiple resources (truncated)"
+#                     else:
+#                         res_clean = res if res != "*" else "ALL RESOURCES (*)"
+#                         res_title = f"Resource: {res_clean}<br>Outcome if action performed: {outcome}"
+#                     res_node = f"RES_{action_counter}_{res_clean.replace(':', '_').replace('/', '_').replace('*', 'STAR')[:50]}"
+#                     action_counter += 1
+#                     additional_nodes_count += 1
+
+#                     net.add_node(
+#                         res_node,
+#                         label=res_clean.split('/')[-1] if '/' in res_clean else res_clean[:20] + '...' if len(res_clean) > 20 else res_clean,
+#                         title=res_title,
+#                         color="#6ee7b7" if not is_deny else "#fecaca",
+#                         shape="ellipse",
+#                         size=25,
+#                         font={"size": 12, "color": "#064e3b" if not is_deny else "#7f1d1d"}
+#                     )
+#                     res_edge_label = "on" if not is_deny else "denied on"
+#                     net.add_edge(action_node, res_node, label=res_edge_label, color="#34d399" if not is_deny else "#ef4444", width=2, dashes=is_deny)
+
+#     # Professional Legend + Font Awesome with full integrity
+#     legend_html = """
+#     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" integrity="sha512-Avb2QiuDEEvB4bZJYdft2mNjVShBftLdPG8fj0V7irTLQ8Uo0qcPxh4Plq7G5tGm0rU+1SPhVotteLpBERwTkw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+#     <div style="position:fixed;top:15px;left:15px;background:#ffffff;padding:20px 25px;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,0.1);z-index:9999;font-family:Amazon Ember,Arial,sans-serif">
+#       <h3 style="margin:0 0 12px;color:#0f172a;font-weight:bold">IAM X-Ray v1.0.0-beta</h3>
+      
+#       <div style="font-size:14px;line-height:1.8;color:#475569">
+#         <div><span style="color:#dc2626;font-weight:bold">High Risk</span> — Escalation / Persistence / Destructive</div>
+#         <div><span style="color:#f97316;font-weight:bold">Medium Risk</span> — Data Read/Write / Broad Access</div>
+#         <div><span style="color:#6366f1;font-weight:bold">Low Risk</span> — List / Describe / Metadata</div>
+#         <div><span style="color:#ef4444;font-weight:bold">Deny</span> — Explicit Deny</div>
+#         <div><span style="color:#3b82f6">Blue</span> User • <span style="color:#f59e0b">Orange</span> Group</div>
+#         <div><span style="color:#10b981">Green</span> Role • <span style="color:#8b5cf6">Purple</span> Policy</div>
+#         <div><span style="color:#a5b4fc">Indigo</span> Service • <span style="color:#6ee7b7">Green</span> Resource</div>
+#       </div>
+
+#     </div>
+#     """
+
+#     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
+#     html_path = os.path.join(tmpdir, "graph.html")
+#     net.write_html(html_path)
+#     with open(html_path, "r", encoding="utf-8") as f:
+#         html_str = f.read()
+
+#     # Inject legend & font awesome
+#     html_str = html_str.replace("<head>", "<head><meta charset='utf-8'>")
+#     html_str = html_str.replace("<body>", f"<body style='margin:0;background:#f8fafc'>{legend_html}")
+
+#     export_path = os.path.join(tempfile.gettempdir(), "iam_xray_graph.json")
+#     export_graph_json(G, export_path)
+#     with open(export_path, "rb") as f:
+#         export_bytes = f.read()
+
+#     return G, html_str, None, export_bytes, None
+
+# core/graph_builder.py
+"""
+Safe, trimmed IAM graph builder for IAM X-Ray v0.1.0-beta.
+
+- Filters AWS-managed policies & service-linked roles early to avoid explosion.
+- Caps default graph size via MAX_NODES and preserves changed/risky nodes from snapshot diff.
+- Lightweight policy analysis for risk-highlighting.
+- Maintains compatibility with previous API:
+    build_graph(snapshot, show_only_risky=False) -> networkx.DiGraph
+    build_iam_graph(snapshot, ...) -> (G, html_str, clicked_node, export_bytes)
+    search_permissions(G, query) -> dict
+"""
 import os
-import logging
 import re
 import json
-import difflib
+import tempfile
+import logging
+import random # for potential sampling
 from datetime import datetime, timedelta
-
-from core import secure_store   # 🔑 new import for encrypted snapshot support
-
-logging.basicConfig(level=logging.INFO)
+import networkx as nx
+from pyvis.network import Network
+# Try to import secure_store (some versions provide decrypt_and_read)
+from core import secure_store
 logger = logging.getLogger("graph_builder")
-
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    logger.addHandler(ch)
+# Colors used in UI
 NODE_COLORS = {
-    "user": "#3B82F6",     # Blue
-    "group": "#F59E0B",    # Orange
-    "role": "#10B981",     # Green
-    "policy": "#6B7280",   # Gray
-    "principal": "#9CA3AF" # Light Gray
+    "user": "#3B82F6",
+    "group": "#F59E0B",
+    "role": "#10B981",
+    "policy": "#6B7280",
+    "principal": "#9CA3AF",
 }
-
-MAX_NODES = 500  # Limit for large graphs
-CLUSTER_THRESHOLD = 1000  # Threshold for clustering
-# ================== NEW HELPERS ==================
-
-def load_snapshot(path):
-    """
-    Load IAM snapshot - supports both encrypted and plaintext.
-    """
-    try:
-        return secure_store.read_and_decrypt(path)
-    except Exception:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
+# Safety limits for beta
+MAX_NODES = 200 # target cap for interactive graph
+CLUSTER_THRESHOLD = 600 # not used aggressively in beta
+MAX_ADDITIONAL_NODES = 500 # increased to handle more nodes without failure
+# AWS-managed/service-linked detection
+AWS_MANAGED_PREFIX = "arn:aws:iam::aws:policy/"
+AWS_SERVICE_ROLE_PATTERNS = [r"AWSServiceRoleFor", r"^aws-service-role/"]
+AWS_DEFAULT_ROLE_NAMES = ["OrganizationAccountAccessRole"]
+# Risk patterns for light analyzer
 RISKY_PATTERNS = [
     r"\*",
     r"iam:PassRole",
     r"sts:AssumeRole",
-    r"s3:\*",
-    r"kms:\*",
-    r"ec2:\*",
 ]
-
-def analyze_policy_document(doc):
+# ================= REAL WORLD DANGEROUS IAM ACTIONS (2025 EDITION) =================
+DANGEROUS_ACTIONS = {
+    # Privilege Escalation Goldmine
+    "iam:CreatePolicy": "Creates a new IAM policy, potentially granting broad permissions.",
+    "iam:CreatePolicyVersion": "Overwrites policy versions, allowing modification of existing permissions.",
+    "iam:SetDefaultPolicyVersion": "Activates a specific policy version, possibly reverting to risky settings.",
+    "iam:AttachUserPolicy": "Attaches policy to user, granting new permissions.",
+    "iam:AttachGroupPolicy": "Attaches policy to group, affecting multiple users.",
+    "iam:AttachRolePolicy": "Attaches policy to role, enabling service access.",
+    "iam:PutUserPolicy": "Adds inline policy to user, customizing permissions.",
+    "iam:PutGroupPolicy": "Adds inline policy to group, customizing group permissions.",
+    "iam:PutRolePolicy": "Adds inline policy to role, customizing role permissions.",
+    "iam:UpdateAssumeRolePolicy": "Modifies role trust policy, changing who can assume the role.",
+    "iam:PassRole": "Passes role to services, potentially escalating privileges.",
+    "sts:AssumeRole": "Assumes another role, switching identities with its permissions.",
+    "iam:CreateAccessKey": "Creates long-term access keys, risking credential exposure.",
+    "iam:CreateLoginProfile": "Sets console password, enabling console access.",
+    # Full Control
+    "ec2:RunInstances": "Launches new EC2 instances, potentially with attached roles.",
+    "lambda:CreateFunction": "Creates new Lambda functions, executing code.",
+    "lambda:InvokeFunction": "Triggers Lambda execution, running code.",
+    "lambda:UpdateFunctionCode": "Updates Lambda code, modifying behavior.",
+    # Data Exfil
+    "s3:GetObject": "Downloads objects from S3, accessing data.",
+    "s3:ListBucket": "Lists S3 bucket contents, discovering objects.",
+    "secretsmanager:GetSecretValue": "Retrieves secrets, exposing sensitive data.",
+    "ssm:GetParameter": "Retrieves SSM parameters, accessing configs.",
+    # Wildcards
+    "*": "Grants full access, equivalent to Administrator.",
+    "s3:*": "Full S3 access, including delete and put.",
+    "ec2:*": "Full EC2 control, including terminate.",
+    # Add more common
+    "ec2:TerminateInstances": "Permanently deletes EC2 instances.",
+    "s3:DeleteObject": "Deletes S3 objects, causing data loss.",
+    "iam:*": "Full IAM control, high escalation risk.",
+}
+# HIGH-RISK actions as set for fast lookup (lowercase)
+HIGH_RISK_ACTIONS = set(act.lower() for act in [
+    "iam:createpolicy", "iam:createpolicyversion", "iam:setdefaultpolicyversion",
+    "iam:attachuserpolicy", "iam:attachgrouppolicy", "iam:attachrolepolicy",
+    "iam:putuserpolicy", "iam:putgrouppolicy", "iam:putrolepolicy",
+    "iam:updateassumerolepolicy", "iam:passrole", "sts:assumerole",
+    "iam:createaccesskey", "iam:createloginprofile",
+    # Add destructive
+    "ec2:terminateinstances", "s3:deletebucket", "rds:deletedbinstance",
+])
+# MEDIUM-RISK patterns
+MEDIUM_RISK_PATTERNS = [
+    r"\*$", # ends with *
+    r":\*$", # service:*
+    r"^\*$", # *
+]
+# LOW-RISK examples (for classification)
+LOW_RISK_ACTIONS = set(act.lower() for act in [
+    "ec2:describeinstances", "s3:listbucket", "iam:listpolicies",
+    "logs:describelogstreams", "cloudtrail:describetrails",
+])
+def load_snapshot(path):
     """
-    Scan a policy document and return risky findings (actions with wildcards or sensitive services).
+    Load IAM snapshot - supports encrypted (.enc) and plaintext (.json).
+    Tries secure_store.decrypt_and_read or secure_store.read_and_decrypt if present.
+    """
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Snapshot not found: {path}")
+    # prefer secure_store.decrypt_and_read
+    try:
+        if hasattr(secure_store, "decrypt_and_read"):
+            return secure_store.decrypt_and_read(path)
+        if hasattr(secure_store, "read_and_decrypt"):
+            return secure_store.read_and_decrypt(path)
+    except Exception as e:
+        logger.debug(f"secure_store decrypt/read failed: {e}. Trying plaintext fallback.")
+    # plaintext fallback
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+# ------------------- Lightweight policy analyzer ---------------------
+def _ensure_list(x):
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+def _lightweight_policy_findings(doc):
+    """
+    Minimal, fast checks:
+      - action/resource wildcard
+      - iam:PassRole, sts:AssumeRole
+    Returns list of finding dicts.
     """
     findings = []
     if not isinstance(doc, dict):
         return findings
-
     stmts = doc.get("Statement", [])
     if isinstance(stmts, dict):
         stmts = [stmts]
-
-    for stmt in stmts:
-        actions = stmt.get("Action") or stmt.get("NotAction")
-        if not actions:
-            continue
-        if isinstance(actions, str):
-            actions = [actions]
-        for act in actions:
-            for pat in RISKY_PATTERNS:
-                if re.fullmatch(pat.replace("*", ".*"), act, flags=re.IGNORECASE):
-                    findings.append({"action": act, "pattern": pat, "effect": stmt.get("Effect", "Allow")})
+    for idx, stmt in enumerate(stmts):
+        effect = stmt.get("Effect", "Allow").lower()
+        actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+        resources = _ensure_list(stmt.get("Resource"))
+        for a in actions:
+            if not isinstance(a, str):
+                continue
+            al = a.lower()
+            if al == "*" or "*" in al:
+                findings.append({"code": "ACTION_WILDCARD", "message": f"Action wildcard: {a}", "effect": effect})
+            if al in ("iam:passrole", "sts:assumerole"):
+                findings.append({"code": "SENSITIVE_ACTION", "message": f"Sensitive action: {a}", "effect": effect})
+        for r in resources:
+            if isinstance(r, str) and r.strip() == "*":
+                findings.append({"code": "RESOURCE_WILDCARD", "message": "Resource '*' used", "effect": effect})
     return findings
-
-
-def search_permissions(G, query):
-    """
-    Search who can perform a given action, or what a given entity can do.
-    - If query looks like 'service:Action', return entities allowed.
-    - If query matches a node name, return its permissions.
-    - If no exact match, suggest close matches.
-    """
-    results = {}
-    if not query:
-        return results
-
-    query_low = query.lower()
-    is_regex = query.startswith("/")
-    if is_regex:
-        query = query[1:]
-        query_low = query_low[1:]
-        try:
-            regex_pat = re.compile(query, re.IGNORECASE)
-        except re.error:
-            return {"error": "Invalid regex pattern"}
-
-    # Case 1: Action search (e.g., s3:PutObject)
-    if ":" in query_low:
-        matches = []
-        for n, attrs in G.nodes(data=True):
-            if attrs.get("type") == "policy":
-                doc = (attrs.get("meta") or {}).get("Document")
-                if doc:
-                    findings = analyze_policy_document(doc)
-                    for f in findings:
-                        act_low = f["action"].lower()
-                        if (not is_regex and query_low == act_low) or (is_regex and regex_pat.search(act_low)):
-                            matches.append(n)
-        # Deep traversal: Find who has access via attached policies
-        who_can_do = set()
-        for m in matches:
-            who_can_do.update(G.predecessors(m))
-        results["action_search"] = {query: matches}
-        results["who_can_do"] = list(who_can_do)
-        return results
-
-    # Case 2: Entity search
-    target_node = None
-    for node in G.nodes:
-        if node.lower() == query_low:
-            target_node = node
-            break
-
-    if target_node and target_node in G.nodes:
-        attrs = G.nodes[target_node]
-        node_type = attrs.get("type")
-        if node_type == "policy":
-            doc = (attrs.get("meta") or {}).get("Document")
-            if doc:
-                findings = analyze_policy_document(doc)
-                results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
-        else:
-            # For user/group/role/principal: find attached/outgoing policies and their findings
-            attached_policies = [succ for succ in G.successors(target_node) if G.nodes[succ].get("type") == "policy"]
-            entity_findings = {}
-            for pname in attached_policies:
-                doc = (G.nodes[pname].get("meta") or {}).get("Document")
-                if doc:
-                    findings = analyze_policy_document(doc)
-                    entity_findings[pname] = findings if findings else [{"message": "✅ No risky actions"}]
-            results["entity"] = dict(attrs)
-            results["entity_attached_findings"] = entity_findings
-    else:
-        # No exact node → suggest fuzzy matches
-        close_matches = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.8)
-        if close_matches:
-            results["fuzzy_matches"] = close_matches
-
-    return results
-
-# ================== EXISTING HELPERS (untouched) ==================
-
-def _node_label(name, kind, risky=False, score=0):
-    prefix = {
-        "user": "👤 ",
-        "group": "👥 ",
-        "role": "🎭 ",
-        "policy": "📜 ",
-        "principal": "🔑 "
-    }.get(kind, "")
-    label = f"{prefix}{name}"
-    if risky:
-        label = f"🔥 {label}"
-    if score and score > 0:
-        label = f"{label} ({score})"
-    return label
-
-def _risk_color(score):
-    if score is None:
-        score = 0
-    score = max(0, min(score, 10))
-    r = int((score / 10) * 255)
-    g = int(((10 - score) / 10) * 200)
-    b = 60
-    return f"rgb({r},{g},{b})"
-
+# ------------------- Helpers to detect AWS-managed/service roles ---------------------
+def _is_aws_managed_policy(p):
+    arn = (p or {}).get("Arn") or ""
+    name = (p or {}).get("PolicyName") or ""
+    if isinstance(arn, str) and arn.startswith(AWS_MANAGED_PREFIX):
+        return True
+    # also catch obvious patterns
+    if isinstance(name, str) and (name.startswith("AWS") or "Amazon" in name):
+        # conservative: only skip if clearly AWS-managed naming
+        if "Managed" in name or "AWS" in name:
+            return True
+    return False
+def _is_service_linked_role(r):
+    name = (r or {}).get("RoleName") or ""
+    if not name:
+        return False
+    for pat in AWS_SERVICE_ROLE_PATTERNS:
+        if re.search(pat, name, flags=re.IGNORECASE):
+            return True
+    if name in AWS_DEFAULT_ROLE_NAMES:
+        return True
+    return False
+# ------------------- Diff-based keep set ---------------------
 def compute_keep_set_from_diff(snapshot):
     """Return set of entity names that are added/modified (for all entity types)."""
     d = (snapshot or {}).get("_meta", {}).get("diff", {}) or {}
@@ -2575,348 +2326,527 @@ def compute_keep_set_from_diff(snapshot):
             if n:
                 keep.add(n)
     return keep
-
+# ------------------- Build adjacency helper ---------------------
 def build_adjacency(G):
-    """Return {node: {incoming: [...], outgoing: [...]}}."""
+    """Return {node: {incoming: [...], outgoing: [...]}} for a networkx graph."""
     adj = {}
     for n in G.nodes:
         incoming = sorted([x for x in G.predecessors(n)]) if hasattr(G, "predecessors") else []
         outgoing = sorted([x for x in G.successors(n)]) if hasattr(G, "successors") else []
         adj[n] = {"incoming": incoming, "outgoing": outgoing}
     return adj
-
 def export_graph_json(G, path="graph.json"):
+    """Export a compact nodes/edges JSON for download/debug."""
     data = {
-        "nodes": [{"id": n, **attrs} for n, attrs in G.nodes(data=True)],
-        "edges": [{"source": u, "target": v, **attrs} for u, v, attrs in G.edges(data=True)],
+        "nodes": [{"id": n, **dict(G.nodes[n])} for n in G.nodes()],
+        "edges": [{"source": u, "target": v, **(dict(e) if isinstance(e, dict) else {})} for u, v, e in G.edges(data=True)]
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return path
-
+# ------------------- Build trimmed graph (core fix) ---------------------
 def build_graph(snapshot, show_only_risky=False):
-    if not snapshot or not any(key in snapshot for key in ["users", "groups", "roles", "policies"]):
+    """
+    Build a networkx DiGraph from snapshot with safety trimming:
+      - Filter out AWS-managed policies and service-linked roles early.
+      - Cap node count to MAX_NODES preserving changed/risky nodes if possible.
+    Returns: nx.DiGraph
+    """
+    if not snapshot or not any(k in snapshot for k in ("users", "groups", "roles", "policies")):
         logger.warning("Invalid or empty snapshot data")
         return nx.DiGraph()
-
-    G = nx.DiGraph()
-
-    total_entities = len(snapshot.get("users", [])) + len(snapshot.get("groups", [])) + len(snapshot.get("roles", [])) + len(snapshot.get("policies", []))
-    if total_entities > MAX_NODES:
-        logger.warning(f"Graph too large ({total_entities} entities > {MAX_NODES}). Subsampling changed nodes.")
-        keep_set = compute_keep_set_from_diff(snapshot)
-        if keep_set:
-            G = nx.subgraph(G, keep_set)
-
-    for u in snapshot.get("users", []):
-        name = u.get("UserName")
-        if name:
-            risky = bool(u.get("IsRisky"))
-            G.add_node(name, type="user", risky=risky, meta=u)
-
-    for g in snapshot.get("groups", []):
-        gname = g.get("GroupName")
-        if not gname:
+    # -- Pre-filter lists to remove heavy AWS-managed/service items --
+    users = snapshot.get("users", []) or []
+    groups = snapshot.get("groups", []) or []
+    roles = snapshot.get("roles", []) or []
+    policies = snapshot.get("policies", []) or []
+    filtered_policies = []
+    for p in policies:
+        try:
+            if _is_aws_managed_policy(p):
+                continue
+        except Exception:
+            # if detection fails, keep policy to be safe
+            filtered_policies.append(p)
             continue
-        risky = bool(g.get("IsRisky"))
-        G.add_node(gname, type="group", risky=risky, meta=g)
-        for ap in g.get("AttachedPolicies", []) or []:
-            pname = ap.get("PolicyName")
-            if pname:
-                if not G.has_node(pname):
-                    G.add_node(pname, type="policy", risky=False, meta={})
-                G.add_edge(gname, pname, relation="attached")
-
-    for r in snapshot.get("roles", []):
-        rname = r.get("RoleName")
+        filtered_policies.append(p)
+    filtered_roles = []
+    for r in roles:
+        try:
+            if _is_service_linked_role(r):
+                continue
+        except Exception:
+            filtered_roles.append(r)
+            continue
+        filtered_roles.append(r)
+    # Quick counts
+    total_entities = len(users) + len(groups) + len(filtered_roles) + len(filtered_policies)
+    logger.info(f"Entities after AWS-managed/service-role filtering: users={len(users)}, groups={len(groups)}, roles={len(filtered_roles)}, policies={len(filtered_policies)} (total={total_entities})")
+    # Decide keep set based on diff (prefer changed/risky)
+    keep_set = compute_keep_set_from_diff(snapshot)
+    # Build an ordered list of nodes (prefer keep_set and risky ones)
+    # We'll create a set of node ids to include (strings: user names, group names, role names, policy names)
+    node_candidates = []
+    def add_candidate(name, t, score=0, risky=False):
+        node_candidates.append({"id": name, "type": t, "score": score, "risky": risky})
+    for p in filtered_policies:
+        pname = p.get("PolicyName") or p.get("Arn")
+        if not pname:
+            continue
+        is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+        add_candidate(pname, "policy", score=p.get("RiskScore") or 0, risky=is_risky)
+    for r in filtered_roles:
+        rname = r.get("RoleName") or r.get("Arn")
         if not rname:
             continue
-        role_risk = bool(r.get("AssumePolicyRisk"))
-        role_score = r.get("AssumePolicyRiskScore") or 0
-        G.add_node(rname, type="role", risky=role_risk, meta=r, risk_score=role_score)
-        for ap in r.get("AttachedPolicies", []) or []:
-            pname = ap.get("PolicyName")
-            if pname:
-                if not G.has_node(pname):
-                    G.add_node(pname, type="policy", risky=False, meta={})
-                G.add_edge(rname, pname, relation="attached")
-        for pr in r.get("PrincipalsInfo") or []:
-            short = pr["value"].split("/")[-1] if isinstance(pr.get("value"), str) and "/" in pr.get("value") else pr.get("value")
-            node_name = f"PRINC:{short}"
-            if not G.has_node(node_name):
-                G.add_node(node_name, type="principal", risky=False, meta={"principal": pr.get("value"), "principal_type": pr.get("type")})
-            G.add_edge(node_name, rname, relation="assumes")
-
-    for p in snapshot.get("policies", []):
-        pname = p.get("PolicyName")
-        if pname:
-            is_risky = bool(p.get("IsRisky"))
-            score = p.get("RiskScore") or 0
-            G.add_node(pname, type="policy", risky=is_risky, meta=p, risk_score=score)
-
-    for u in snapshot.get("users", []):
+        role_risk = bool(r.get("AssumePolicyRisk")) or bool(r.get("AssumePolicyFindings"))
+        add_candidate(rname, "role", score=r.get("AssumePolicyRiskScore") or 0, risky=role_risk)
+    for g in groups:
+        gname = g.get("GroupName")
+        if gname:
+            add_candidate(gname, "group", risky=bool(g.get("IsRisky")))
+    for u in users:
         uname = u.get("UserName")
-        for gname in u.get("Groups", []) or []:
-            if G.has_node(gname):
-                G.add_edge(uname, gname, relation="member")
-        for ap in u.get("AttachedPolicies", []) or []:
+        if uname:
+            add_candidate(uname, "user", risky=bool(u.get("IsRisky")))
+    # Sort candidates: keep ones from keep_set and risky first, then by score desc
+    def candidate_sort_key(c):
+        return (
+            0 if c["id"] in keep_set else 1,
+            0 if c["risky"] else 1,
+            -int(c.get("score") or 0)
+        )
+    node_candidates_sorted = sorted(node_candidates, key=candidate_sort_key)
+    # Trim to MAX_NODES
+    chosen = node_candidates_sorted[:MAX_NODES]
+    chosen_ids = {c["id"] for c in chosen}
+    logger.info(f"Selected {len(chosen)} nodes (MAX_NODES={MAX_NODES}) for graph")
+    # Build graph only from chosen nodes
+    G = nx.DiGraph()
+    # Add nodes (with meta) for chosen set
+    # Helper to add node if in chosen_ids
+    def add_node_if_chosen(id_name, kind, meta=None, risk_score=0, risky=False):
+        if id_name in chosen_ids and not G.has_node(id_name):
+            attrs = {"type": kind, "meta": meta or {}, "risk_score": risk_score, "risky": bool(risky)}
+            G.add_node(id_name, **attrs)
+    # Add policy nodes
+    policy_map = { (p.get("PolicyName") or p.get("Arn")): p for p in filtered_policies if (p.get("PolicyName") or p.get("Arn")) }
+    for pname, p in policy_map.items():
+        is_risky = bool(p.get("IsRisky")) or bool(_lightweight_policy_findings(p.get("Document") or {}))
+        add_node_if_chosen(pname, "policy", meta=p, risk_score=p.get("RiskScore") or 0, risky=is_risky)
+    # Add role nodes and attachments
+    role_map = { (r.get("RoleName") or r.get("Arn")): r for r in filtered_roles if (r.get("RoleName") or r.get("Arn")) }
+    for rname, r in role_map.items():
+        add_node_if_chosen(rname, "role", meta=r, risk_score=r.get("AssumePolicyRiskScore") or 0, risky=bool(r.get("AssumePolicyRisk")))
+        for ap in (r.get("AttachedPolicies") or []):
             pname = ap.get("PolicyName")
             if pname:
-                if not G.has_node(pname):
-                    G.add_node(pname, type="policy", risky=False, meta={})
-                G.add_edge(uname, pname, relation="attached")
-
+                add_node_if_chosen(pname, "policy")
+                if G.has_node(pname) and G.has_node(rname):
+                    G.add_edge(rname, pname, relation="attached")
+        for pr in (r.get("PrincipalsInfo") or []):
+            short = (pr.get("value") or "").split("/")[-1]
+            node_name = f"PRINC:{short}"
+            add_node_if_chosen(node_name, "principal", meta=pr)
+            if G.has_node(node_name) and G.has_node(rname):
+                G.add_edge(node_name, rname, relation="assumes")
+    # Add groups and their attached policies
+    group_map = { g.get("GroupName"): g for g in groups if g.get("GroupName") }
+    for gname, g in group_map.items():
+        add_node_if_chosen(gname, "group", meta=g, risky=bool(g.get("IsRisky")))
+        for ap in (g.get("AttachedPolicies") or []):
+            pname = ap.get("PolicyName")
+            if pname:
+                add_node_if_chosen(pname, "policy")
+                if G.has_node(gname) and G.has_node(pname):
+                    G.add_edge(gname, pname, relation="attached")
+    # Add users, membership and attached policies
+    user_map = { u.get("UserName"): u for u in users if u.get("UserName") }
+    for uname, u in user_map.items():
+        add_node_if_chosen(uname, "user", meta=u, risky=bool(u.get("IsRisky")))
+        for gname in (u.get("Groups") or []):
+            if G.has_node(uname) and G.has_node(gname):
+                G.add_edge(uname, gname, relation="member")
+        for ap in (u.get("AttachedPolicies") or []):
+            pname = ap.get("PolicyName")
+            if pname:
+                add_node_if_chosen(pname, "policy")
+                if G.has_node(uname) and G.has_node(pname):
+                    G.add_edge(uname, pname, relation="attached")
+    # If show_only_risky option set, filter G down
     if show_only_risky:
-        def filter_node(n):
-            return G.nodes[n].get("risky", False)
-        def filter_edge(u, v):
-            return filter_node(u) or filter_node(v)
-        G = nx.subgraph_view(G, filter_node=filter_node, filter_edge=filter_edge)
-
+        risky_nodes = [n for n, a in G.nodes(data=True) if a.get("risky")]
+        H = G.subgraph(risky_nodes).copy()
+        return H
     return G
-
-def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None,
-                    highlight_color="#ffeb3b", highlight_duration=2200):
-    if not snapshot or not any(key in snapshot for key in ["users", "groups", "roles", "policies"]):
-        logger.warning("Invalid or empty snapshot data")
-        return nx.DiGraph(), "<div>No data to display</div>", None, b"{}"
-
-    G_full = build_graph(snapshot, show_only_risky=show_only_risky)
-    G = G_full
-
-    if len(G.nodes) > MAX_NODES:
-        keep_set = compute_keep_set_from_diff(snapshot)
-        if keep_set:
-            G = nx.subgraph(G_full, keep_set)
-    if len(G.nodes) > CLUSTER_THRESHOLD:
-        logger.info(f"Applying clustering for {len(G.nodes)} nodes")
-        communities = nx.community.greedy_modularity_communities(G)
-        for i, comm in enumerate(communities):
-            cluster_name = f"Cluster_{i}"
-            G.add_node(cluster_name, type="cluster", size=30)
-            for node in comm:
-                G.add_edge(cluster_name, node, relation="cluster_member")
-
-    net = Network(height="760px", width="100%", notebook=False, directed=True)
+# ------------------- Search (keeps compatibility with previous API) ---------------------
+import difflib
+def search_permissions(G, query):
+    """
+    Search who can perform a given action (lightweight), or return attached findings for an entity.
+    Works with networkx DiGraph created by build_graph.
+    """
+    results = {}
+    if not query:
+        return results
+    q_low = query.lower()
+    is_regex = q_low.startswith("/")
+    regex_pat = None
+    if is_regex:
+        try:
+            regex_pat = re.compile(query[1:], re.IGNORECASE)
+        except re.error:
+            return {"error": "Invalid regex"}
+    # If it looks like an action (contains ':') scan policy nodes
+    if ":" in q_low:
+        matches = []
+        for n, attrs in G.nodes(data=True):
+            if attrs.get("type") == "policy":
+                doc = (attrs.get("meta") or {}).get("Document") or {}
+                findings = _lightweight_policy_findings(doc)
+                for f in findings:
+                    msg = f.get("message", "").lower()
+                    if (not is_regex and q_low in msg) or (is_regex and regex_pat.search(msg)):
+                        matches.append(n)
+                        break
+        who_can_do = set()
+        for m in matches:
+            # predecessors are entities that reference the policy
+            if hasattr(G, "predecessors"):
+                try:
+                    who_can_do.update(list(G.predecessors(m)))
+                except Exception:
+                    pass
+        results["action_search"] = {query: matches}
+        results["who_can_do"] = list(who_can_do)
+        return results
+    # Entity search
+    # exact match
+    target = None
+    for n in G.nodes:
+        if n.lower() == q_low:
+            target = n
+            break
+    if target:
+        attrs = G.nodes[target]
+        if attrs.get("type") == "policy":
+            doc = (attrs.get("meta") or {}).get("Document") or {}
+            findings = _lightweight_policy_findings(doc)
+            results["entity_policies"] = findings if findings else [{"message": "✅ No risky actions"}]
+        else:
+            attached = [s for s in G.successors(target) if G.nodes[s].get("type") == "policy"]
+            entity_findings = {}
+            for p in attached:
+                doc = (G.nodes[p].get("meta") or {}).get("Document") or {}
+                entity_findings[p] = _lightweight_policy_findings(doc) or [{"message": "✅ No risky actions"}]
+            results["entity"] = dict(attrs)
+            results["entity_attached_findings"] = entity_findings
+        return results
+    # fuzzy matches
+    close = difflib.get_close_matches(query, list(G.nodes), n=3, cutoff=0.7)
+    if close:
+        results["fuzzy_matches"] = close
+    return results
+def build_iam_graph(snapshot, show_only_risky=False, highlight_node=None, highlight_color="#ffeb3b", highlight_duration=2200):
+    """
+    IAM X-Ray v1.0 — Beta
+    """
+    G = build_graph(snapshot, show_only_risky=show_only_risky)
+    if len(G.nodes) == 0:
+        empty_html = "<div style='text-align:center;padding:100px;font-size:24px;color:#666;'>No entities match current filters</div>"
+        return nx.DiGraph(), empty_html, None, b"{}", {"reason": "no_matching_nodes"}
+    net = Network(
+        height="100vh",
+        width="100%",
+        directed=True,
+        bgcolor="#ffffff",
+        font_color="#1e293b"
+    )
     net.set_options("""
     {
-      "physics": {"enabled": true, "solver": "repulsion",
-        "repulsion": {"centralGravity": 0.2, "springLength": 180, "springConstant": 0.02},
-        "stabilization": {"iterations": 1500, "updateInterval": 25}
+      "physics": {
+        "enabled": true,
+        "solver": "forceAtlas2Based",
+        "forceAtlas2Based": {
+          "gravitationalConstant": -80,
+          "centralGravity": 0.01,
+          "springLength": 220,
+          "springConstant": 0.04,
+          "damping": 0.9
+        },
+        "stabilization": {"iterations": 300}
       },
-      "interaction": {"hover": true, "navigationButtons": true, "zoomView": true, "dragView": true}
+      "interaction": {
+        "hover": true,
+        "zoomView": true,
+        "dragView": true,
+        "navigationButtons": false
+      },
+      "edges": {
+        "smooth": {"type": "cubicBezier", "roundness": 0.5},
+        "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
+        "font": {"size": 12, "color": "#64748b"},
+        "color": "#94a3b8",
+        "width": 2
+      }
     }
     """)
-
-    impact_score = snapshot.get("_meta", {}).get("diff", {}).get("impact_score")
-
-    node_list = []
+    # Node colors
+    def get_node_color(ntype, risky=False):
+        if risky: return "#dc2626"
+        return {
+            "user": "#3b82f6",
+            "group": "#f59e0b",
+            "role": "#10b981",
+            "policy": "#8b5cf6",
+            "principal": "#94a3b8"
+        }.get(ntype, "#64748b")
+    # Add main entities with AWS ICONS
     for node, attrs in G.nodes(data=True):
-        ntype = attrs.get("type", "node")
+        ntype = attrs.get("type", "unknown")
+        title = node
         risky = attrs.get("risky", False)
-        meta = attrs.get("meta", {})
-        score = attrs.get("risk_score") or (meta.get("RiskScore") if isinstance(meta, dict) else 0) or 0
-        change_flag = meta.get("_changed")
-        change_details = "➕ Added" if change_flag == "added" else "🔄 Modified" if change_flag == "modified" else ""
-
-        tlines = []
         if ntype == "policy":
-            findings = meta.get("Findings") or []
-            findings_count = len(findings)
-            unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-            tlines = [
-                f"Policy: {meta.get('PolicyName')}",
-                f"Arn: {meta.get('Arn')}",
-                f"IsRisky: {meta.get('IsRisky')}",
-                f"RiskScore: {meta.get('RiskScore')}",
-                f"Findings: {findings_count}",
-                f"Unused Actions: {unused_count}",
-                change_details
-            ] if findings else [
-                f"Policy: {meta.get('PolicyName')}",
-                f"Arn: {meta.get('Arn')}",
-                f"IsRisky: {meta.get('IsRisky')}",
-                f"RiskScore: {meta.get('RiskScore')}",
-                f"Findings: 0 ✅ No risky actions",
-                change_details
-            ]
-            slu = meta.get("ServiceLastUsed", {})
-            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-            if unused:
-                tlines.append("Unused services: " + ", ".join(unused))
+            title = f"Policy: {node}<br>Risk Score: {attrs.get('risk_score', 0)}<br>Attached to: {', '.join(G.predecessors(node)) or 'None'}"
         elif ntype == "role":
-            trust_find_count = len(meta.get("AssumePolicyFindings") or [])
-            tlines = [
-                f"Role: {meta.get('RoleName')}",
-                f"Arn: {meta.get('Arn')}",
-                f"AssumeRisk: {meta.get('AssumePolicyRisk')}",
-                f"AssumeScore: {meta.get('AssumePolicyRiskScore')}",
-                f"TrustFindings: {trust_find_count}",
-                change_details
-            ]
-            slu = meta.get("ServiceLastUsed", {})
-            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-            if unused:
-                tlines.append("Unused services: " + ", ".join(unused))
+            title = f"Role: {node}<br>Can be assumed by: {', '.join(G.predecessors(node)) or 'None'}<br>Policies: {', '.join(G.successors(node)) or 'None'}"
+        elif ntype == "group":
+            title = f"Group: {node}<br>Members: {', '.join(G.predecessors(node)) or 'None'}<br>Policies: {', '.join(G.successors(node)) or 'None'}"
+        elif ntype == "user":
+            title = f"User: {node}<br>Groups: {', '.join(G.successors(node)) or 'None'}<br>Policies: {', '.join([s for s in G.successors(node) if G.nodes[s]['type'] == 'policy']) or 'None'}"
+        # AWS Console Style Icons
+        icon = ""
+        if ntype == "user":
+            icon = "" # fa-user
+        elif ntype == "group":
+            icon = "" # fa-users
+        elif ntype == "role":
+            icon = "" # fa-user-shield
+        elif ntype == "policy":
+            icon = "" # fa-file-contract
         elif ntype == "principal":
-            tlines = [f"Principal: {meta.get('principal')}", f"Type: {meta.get('principal_type')}", change_details]
-        else:
-            tlines = [str(meta), change_details]
-            slu = meta.get("ServiceLastUsed", {})
-            unused = [s.get("serviceNamespace") for s in slu.get("services", []) if s.get("lastAuthenticated") and (datetime.utcnow() - datetime.fromisoformat(s.get("lastAuthenticated").replace("Z", "+00:00"))).days > 90]
-            if unused:
-                tlines.append("Unused services: " + ", ".join(unused))
-
-        color = _risk_color(score) if score > 0 else NODE_COLORS.get(ntype, "#CCCCCC")
-        if risky and not score:
-            color = "#FF6B6B"
-        size = 18 + (score * 2) if score else 18
-        if node == highlight_node:
-            size = max(size, 36)
-
-        node_list.append({
-            "id": node,
-            "label": _node_label(node, ntype, risky, score),
-            "title": "<br>".join([str(x) for x in tlines if x]),
-            "color": color,
-            "size": size
-        })
-
-    net.add_nodes([n["id"] for n in node_list], label=[n["label"] for n in node_list],
-                  title=[n["title"] for n in node_list], color=[n["color"] for n in node_list],
-                  size=[n["size"] for n in node_list])
-
-    for u, v, ed in G.edges(data=True):
-        rel = ed.get("relation", "")
-        u_attrs = G.nodes[u]
-        v_attrs = G.nodes[v]
-        u_risky = u_attrs.get("risky", False)
-        v_risky = v_attrs.get("risky", False)
-        u_score = u_attrs.get("risk_score", 0) or 0
-        v_score = v_attrs.get("risk_score", 0) or 0
-        edge_color = "#FF6B6B" if u_risky or v_risky else "#CCCCCC"
-        if v_attrs.get("type") == "policy":
-            findings = v_attrs.get("meta", {}).get("Findings") or []
-            unused_count = len([f for f in findings if f.get("code") == "UNUSED_ACTION"])
-            if unused_count > 0:
-                edge_color = "#CCCCCC"
-        edge_width = 1 + int((u_score + v_score) / 5)
-        if rel == "assumes":
-            edge_width += 1
-        net.add_edge(u, v, title=rel, width=edge_width, color=edge_color)
-
-    export_data = export_graph_json(G)
-
+            icon = "" # fa-cloud
+        title_html = f"<b>{node}</b><br><small>{title}</small>"
+        if risky:
+            title_html = f"Warning: {title_html}"
+        size = 50 if risky else 45
+        if highlight_node and highlight_node.lower() in node.lower():
+            size += 20
+        net.add_node(
+            node,
+            label=f"{icon} {node}",
+            title=title_html,
+            color=get_node_color(ntype, risky),
+            size=size,
+            font={"size": 18, "face": "Amazon Ember, Arial", "color": "#1e293b"},
+            shape="dot",
+            borderWidth=4 if risky else 2,
+            shadow=True
+        )
+    # Add edges
+    for u, v, data in G.edges(data=True):
+        rel = data.get("relation", "")
+        label = ""
+        color = "#64748b"
+        dashes = False
+        if rel == "member":
+            label = "member of"
+            color = "#3b82f6"
+        elif rel == "attached":
+            label = "has policy"
+            color = "#8b5cf6"
+        elif rel == "assumes":
+            label = "can assume"
+            color = "#10b981"
+            dashes = True
+        net.add_edge(u, v, label=label, color=color, dashes=dashes, width=2.5)
+    # MAIN MAGIC: Professional Action Nodes
+    action_counter = 0
+    additional_nodes_count = 0
+    for policy_node, attrs in G.nodes(data=True):
+        if attrs.get("type") != "policy":
+            continue
+        doc = (attrs.get("meta") or {}).get("Document") or {}
+        stmts = doc.get("Statement", [])
+        if not isinstance(stmts, list):
+            stmts = [stmts]
+        for stmt in stmts:
+        
+            effect = stmt.get("Effect", "Allow")
+            is_deny = effect == "Deny"
+            actions = _ensure_list(stmt.get("Action") or stmt.get("NotAction"))
+            resources = _ensure_list(stmt.get("Resource") or ["*"])
+            # To reduce node count, if many actions, sample high-risk ones first
+            high_risk_actions = [a for a in actions if a.lower() in HIGH_RISK_ACTIONS]
+            other_actions = [a for a in actions if a not in high_risk_actions]
+            sampled_actions = high_risk_actions + random.sample(other_actions, min(3, len(other_actions))) if len(other_actions) > 3 else other_actions
+            for action in sampled_actions:
+                if additional_nodes_count > MAX_ADDITIONAL_NODES:
+                    logger.warning("Reached max additional nodes; skipping further actions")
+                    break
+                if not action:
+                    continue
+                action_original = action.strip()
+                action_clean = action_original
+                if action_clean == "*":
+                    action_clean = "* (All Actions)"
+                # Risk Detection using original action
+                al = action_original.lower()
+                risk_level = "low"
+                risk_reason = ""
+                outcome = DANGEROUS_ACTIONS.get(action_original, "Standard operation - no specific risk identified.")
+                if al in HIGH_RISK_ACTIONS:
+                    risk_level = "high"
+                    risk_reason = "Privilege Escalation / Persistence Risk / Destructive"
+                elif any(re.search(pat, al, re.IGNORECASE) for pat in MEDIUM_RISK_PATTERNS):
+                    risk_level = "medium"
+                    risk_reason = "Data read/write or broad access"
+                elif al in LOW_RISK_ACTIONS:
+                    risk_level = "low"
+                    risk_reason = "Listing / describe / metadata"
+                else:
+                    # Default to low if not matched
+                    risk_level = "low"
+                    risk_reason = "Listing / describe / metadata"
+                if is_deny:
+                    risk_level = "deny"
+                    risk_reason = "Explicit Deny"
+                    outcome = "Action Denied: " + outcome
+                # Skip low priority to reduce clutter and potential large graph issues
+                if risk_level == "low":
+                    continue
+                # Smart Label
+                if action_clean == "* (All Actions)":
+                    short_label = "ALL ACTIONS"
+                elif ":" in action_clean:
+                    short_label = action_clean.split(":", 1)[1]
+                    if short_label == "*":
+                        short_label = action_clean.split(":")[0].upper() + ":*"
+                else:
+                    short_label = action_clean
+                if len(short_label) > 20:
+                    short_label = short_label[:17] + "..."
+                # AWS-Style Colors
+                if risk_level == "high":
+                    node_color, border_color = "#dc2626", "#7f1d1d"
+                    size, edge_width, edge_color = 38, 5, "#dc2626"
+                elif risk_level == "medium":
+                    node_color, border_color = "#f97316", "#c2410c"
+                    size, edge_width, edge_color = 34, 4, "#f97316"
+                elif risk_level == "deny":
+                    node_color, border_color = "#ef4444", "#b91c1c"
+                    size, edge_width, edge_color = 30, 3, "#ef4444"
+                else:
+                    node_color, border_color = "#6366f1", "#4338ca"
+                    size, edge_width, edge_color = 28, 2, "#4f46e5"
+                # Title with outcome
+                title_text = f"<b style='font-size:16px'>{action_clean}</b><br>Priority: {risk_level.upper()}<br>Reason: {risk_reason}<br>Outcome: {outcome}"
+                if "*" in ''.join(resources):
+                    title_text += "<br>Resource: * (All Resources)"
+                action_node = f"ACTION_{action_counter}_{action_clean.replace(':', '_').replace('*', 'STAR').replace(' ', '_')[:50]}"
+                action_counter += 1
+                additional_nodes_count += 1
+                net.add_node(
+                    action_node,
+                    label=short_label,
+                    title=title_text,
+                    color={"background": node_color, "border": border_color},
+                    shape="box",
+                    size=size,
+                    font={"size": 14, "color": "white", "face": "Amazon Ember, Arial", "strokeWidth": 3, "strokeColor": "#000"},
+                    borderWidth=3,
+                    shadow=True
+                )
+                edge_label = "denies" if is_deny else "allows"
+                net.add_edge(policy_node, action_node, label=edge_label, color=edge_color, width=edge_width, dashes=(risk_level in ["high", "deny"]))
+                for predecessor in G.predecessors(policy_node):
+                    if G.nodes[predecessor].get("type") in ["user", "role", "group"]:
+                        can_label = "CANNOT" if is_deny else "CAN"
+                        net.add_edge(
+                            predecessor, action_node,
+                            label=can_label,
+                            color=edge_color if risk_level != "low" else "#10b981",
+                            width=edge_width if risk_level != "low" else 2,
+                            font={"size": 14, "color": edge_color if risk_level != "low" else "#166534", "strokeWidth": 2},
+                            dashes=(is_deny)
+                        )
+                # Add service node if applicable
+                if ":" in action_original:
+                    service = action_original.split(":")[0].upper()
+                    service_node = f"SVC_{service}"
+                    # Explicit check
+                    if not any(n['id'] == service_node for n in net.nodes):
+                        additional_nodes_count += 1
+                        net.add_node(
+                            service_node,
+                            label=service,
+                            title=f"AWS Service: {service}<br>Accessed via: {action_clean}",
+                            color="#a5b4fc",
+                            shape="diamond",
+                            size=32,
+                            font={"size": 16, "color": "#312e81"}
+                        )
+                    net.add_edge(action_node, service_node, label="in", color="#6366f1", width=2)
+                # Add resource nodes (limit to 3 per action to prevent explosion)
+                res_list = resources[:3]
+                if len(resources) > 3:
+                    res_list.append("and more...")
+                for res in res_list:
+                    if additional_nodes_count > MAX_ADDITIONAL_NODES:
+                        break
+                    if res == "and more...":
+                        res_clean = "MULTIPLE RESOURCES"
+                        res_title = "Multiple resources (truncated)"
+                    else:
+                        res_clean = res if res != "*" else "ALL RESOURCES (*)"
+                        res_title = f"Resource: {res_clean}<br>Outcome if action performed: {outcome}"
+                    res_node = f"RES_{action_counter}_{res_clean.replace(':', '_').replace('/', '_').replace('*', 'STAR')[:50]}"
+                    action_counter += 1
+                    additional_nodes_count += 1
+                    # Explicit check
+                    if not any(n['id'] == res_node for n in net.nodes):
+                        net.add_node(
+                            res_node,
+                            label=res_clean.split('/')[-1] if '/' in res_clean else res_clean[:20] + '...' if len(res_clean) > 20 else res_clean,
+                            title=res_title,
+                            color="#6ee7b7" if not is_deny else "#fecaca",
+                            shape="ellipse",
+                            size=25,
+                            font={"size": 12, "color": "#064e3b" if not is_deny else "#7f1d1d"}
+                        )
+                    res_edge_label = "on" if not is_deny else "denied on"
+                    net.add_edge(action_node, res_node, label=res_edge_label, color="#34d399" if not is_deny else "#ef4444", width=2, dashes=is_deny)
+    # Professional Legend + Font Awesome with full integrity
+    legend_html = """
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" integrity="sha512-Avb2QiuDEEvB4bZJYdft2mNjVShBftLdPG8fj0V7irTLQ8Uo0qcPxh4Plq7G5tGm0rU+1SPhVotteLpBERwTkw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <div style="position:fixed;top:15px;left:15px;background:#ffffff;padding:20px 25px;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,0.1);z-index:9999;font-family:Amazon Ember,Arial,sans-serif">
+      <h3 style="margin:0 0 12px;color:#0f172a;font-weight:bold">IAM X-Ray v1.0.0-beta</h3>
+  
+      <div style="font-size:14px;line-height:1.8;color:#475569">
+        <div><span style="color:#dc2626;font-weight:bold">High Risk</span> — Escalation / Persistence / Destructive</div>
+        <div><span style="color:#f97316;font-weight:bold">Medium Risk</span> — Data Read/Write / Broad Access</div>
+        <div><span style="color:#6366f1;font-weight:bold">Low Risk</span> — List / Describe / Metadata</div>
+        <div><span style="color:#ef4444;font-weight:bold">Deny</span> — Explicit Deny</div>
+        <div><span style="color:#3b82f6">Blue</span> User • <span style="color:#f59e0b">Orange</span> Group</div>
+        <div><span style="color:#10b981">Green</span> Role • <span style="color:#8b5cf6">Purple</span> Policy</div>
+        <div><span style="color:#a5b4fc">Indigo</span> Service • <span style="color:#6ee7b7">Green</span> Resource</div>
+      </div>
+    </div>
+    """
     tmpdir = tempfile.mkdtemp(prefix="iamxray_")
-    html_path = os.path.join(tmpdir, "iam_graph.html")
-    net.write_html(html_path)
-
-    with open(html_path, "r", encoding="utf-8") as f:
-        html_str = f.read()
-
-    legend_html = f"""
-<div id="iam_legend" style="position:fixed;top:10px;left:10px;background:#111;color:#fff;padding:8px;border-radius:8px;z-index:9999;font-size:13px;max-width:170px;display:none;">
-  <div style="font-weight:700;margin-bottom:6px;">Legend</div>
-  <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['user']};border-radius:50%;margin-right:6px;"></span>👤 User</div>
-  <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['group']};border-radius:50%;margin-right:6px;"></span>👥 Group</div>
-  <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['role']};border-radius:50%;margin-right:6px;"></span>🎭 Role</div>
-  <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['policy']};border-radius:50%;margin-right:6px;"></span>📜 Policy</div>
-  <div style="margin-bottom:3px;"><span style="display:inline-block;width:12px;height:12px;background:{NODE_COLORS['principal']};border-radius:50%;margin-right:6px;"></span>🔑 Principal</div>
-  <div style="margin-top:6px;font-size:12px;color:#ddd;">
-    <span style="display:inline-block;width:12px;height:12px;background:#FF6B6B;border-radius:50%;margin-right:6px;"></span>🔥 = risky
-  </div>
-  <button onclick="toggleLegend()" style="margin-top:5px;padding:2px 6px;font-size:11px;">Toggle</button>
-</div>
-<script>
-function toggleLegend(){{
-    var lg = document.getElementById('iam_legend');
-    if(lg.style.display === 'none'){{ lg.style.display='block'; }}
-    else {{ lg.style.display='none'; }}
-}}
-</script>
-"""
-
-    impact_overlay = ""
-    if impact_score is not None:
-        color = "#10B981" if impact_score <= 2 else ("#F59E0B" if impact_score <= 6 else "#EF4444")
-        impact_overlay = f"<div id='iam_impact' style='position:fixed;top:10px;right:10px;background:{color};color:#fff;padding:6px 10px;border-radius:6px;z-index:9999;font-weight:700;'>Impact: {impact_score}</div>"
-
+    html_path = os.path.join(tmpdir, "graph.html")
     try:
-        highlight_color = str(highlight_color)
-        highlight_duration = int(highlight_duration)
-        highlight_js = """
-<script type="text/javascript">
-let permanentHighlight = false;
-function togglePermanentHighlight() { permanentHighlight = !permanentHighlight; }
-function _getNodeColor(id) { try { return network.body.data.nodes.get(id).color.background; } catch(e) { return null; } }
-function _updateNodeColors(updates) { try { network.body.data.nodes.update(updates); } catch(e) {} }
-function highlightPath(nodeId) {
-    if(!nodeId) return;
-    const connected = network.getConnectedNodes(nodeId) || [];
-    const toHighlight = [nodeId].concat(connected);
-    const original = {};
-    toHighlight.forEach(id => { original[id] = _getNodeColor(id) || null; });
-    const upd = toHighlight.map(id => ({id: id, color: {background: '{COLOR}'}}));
-    _updateNodeColors(upd);
-    const connectedEdges = network.getConnectedEdges(nodeId) || [];
-    const edgeUpdates = connectedEdges.map(eid => {
-        try {
-            const ed = network.body.data.edges.get(eid);
-            if(ed) { return {id: eid, width: (ed.width||1) + 3}; }
-        } catch(e){}
-        return null;
-    }).filter(x=>x);
-    try { network.body.data.edges.update(edgeUpdates); } catch(e) {}
-    if (!permanentHighlight) {
-        setTimeout(() => {
-            const restoreNodes = Object.keys(original).map(id => {
-                const orig = original[id];
-                if(orig) return {id: id, color: {background: orig}};
-                return {id: id};
-            });
-            try { network.body.data.nodes.update(restoreNodes); } catch(e){}
-            try { network.redraw(); } catch(e){}
-        }, {DURATION});
-    }
-}
-network.on("click", function(params) {
-    if (params.nodes.length > 0) {
-        const clickedNode = params.nodes[0];
-        try { highlightPath(clickedNode); } catch(e) {}
-        window.parent.postMessage({type: "iam_node_click", node: clickedNode}, "*");
-        try { localStorage.setItem("iam_last_node", clickedNode); } catch(e){}
-    }
-});
-try {
-    const lastNode = localStorage.getItem("iam_last_node");
-    if (lastNode) {
-        setTimeout(() => { try { highlightPath(lastNode); } catch(e){} }, 800);
-    }
-} catch(e){}
-</script>
-""".format(COLOR=highlight_color, DURATION=highlight_duration)
-    except (ValueError, TypeError) as e:
-        # logger.warning(f"Invalid highlight parameters: {e}. Using defaults.")
-        highlight_js = """
-<script type="text/javascript">
-let permanentHighlight = false;
-function togglePermanentHighlight() { permanentHighlight = !permanentHighlight; }
-function _getNodeColor(id) { try { return network.body.data.nodes.get(id).color.background; } catch(e) { return null; } }
-function _updateNodeColors(updates) { try { network.body.data.nodes.update(updates); } catch(e) {} }
-function highlightPath(nodeId) { if(nodeId) { try { network.selectNodes([nodeId]); } catch(e) {} } }
-network.on("click", function(params) { if (params.nodes.length > 0) { const clickedNode = params.nodes[0]; window.parent.postMessage({type: "iam_node_click", node: clickedNode}, "*"); } });
-</script>
-"""
-
-    try:
-        html_str = html_str.replace("<body>", "<body>" + legend_html + impact_overlay)
-        html_str = re.sub(r"(</body>)", highlight_js + r"\g<0>", html_str, flags=re.IGNORECASE)
+        net.write_html(html_path)
+        with open(html_path, "r", encoding="utf-8") as f:
+            html_str = f.read()
+        # Inject legend & font awesome
+        html_str = html_str.replace("<head>", "<head><meta charset='utf-8'>")
+        html_str = html_str.replace("<body>", f"<body style='margin:0;background:#f8fafc'>{legend_html}")
     except Exception as e:
-        logger.error(f"Error injecting HTML: {e}")
-        html_str = "<div>Error rendering graph</div>"
-
-    clicked_node = None
-    return G, html_str, clicked_node, export_data
-
-def export_graph_json(G):
-    return json.dumps(nx.node_link_data(G, edges="links")).encode()
+        logger.error(f"Failed to write or modify HTML: {e}")
+        html_str = "<div style='text-align:center;padding:100px;font-size:24px;color:#666;'>Graph rendering failed - please try again or check logs</div>"
+    export_path = os.path.join(tempfile.gettempdir(), "iam_xray_graph.json")
+    export_graph_json(G, export_path)
+    with open(export_path, "rb") as f:
+        export_bytes = f.read()
+    return G, html_str, None, export_bytes, None

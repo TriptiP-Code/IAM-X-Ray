@@ -5,12 +5,21 @@ services:
     container_name: iam-xray
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     environment:
-      - IAM_XRAY_FERNET_KEY=${IAM_XRAY_FERNET_KEY}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - KEEP_DAYS=${KEEP_DAYS}
+      # Fallback values if .env missing (critical for Docker)
+      - IAM_XRAY_FERNET_KEY=${IAM_XRAY_FERNET_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - CACHE_TTL=${CACHE_TTL:-3600}
+      - KEEP_DAYS=${KEEP_DAYS:-30}
     volumes:
       - ./data:/app/data
+      - ./.env:/app/.env:ro    # optional: mount .env explicitly
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/?healthz=1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

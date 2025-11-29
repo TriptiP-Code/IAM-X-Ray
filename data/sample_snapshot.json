@@ -1,0 +1,145 @@
+{
+  "_meta": {
+    "fetched_at": "2025-10-24T11:00:00Z",
+    "fast_mode": false,
+    "counts": {
+      "users": 3,
+      "groups": 2,
+      "roles": 2,
+      "policies": 2,
+      "high_risk_entities": 3,
+      "explicit_denies": 5
+    },
+    "demo_mode": true,
+    "demo_insights": [
+      "High-risk wildcard permissions detected",
+      "Privilege escalation chain discovered",
+      "Admin-access assumption path exposed",
+      "Users with indirect admin access found",
+      "Service-level resource impact analysis performed"
+    ]
+  },
+  "users": [
+    {
+      "UserName": "alice",
+      "Arn": "arn:aws:iam::123456789012:user/alice",
+      "Groups": ["DevTeam"],
+      "AttachedPolicies": [],
+      "IsRisky": false,
+      "region": "us-east-1",
+      "EffectivePermissions": ["PowerUserAccess via group"],
+      "DeniedActions": [
+        {"service": "iam", "reason": "PowerUserAccess denies IAM write"},
+        {"service": "organizations", "reason": "Not allowed for non-admins"}
+      ]
+    },
+    {
+      "UserName": "bob",
+      "Arn": "arn:aws:iam::123456789012:user/bob",
+      "Groups": ["DevOps"],
+      "AttachedPolicies": [
+        {"PolicyName": "AmazonEC2FullAccess", "PolicyArn": "arn:aws:iam::aws:policy/AmazonEC2FullAccess"}
+      ],
+      "IsRisky": true,
+      "RiskScore": 8,
+      "Findings": [
+        {"code": "ACTION_WILDCARD", "severity": "HIGH", "action": "ec2:*"}
+      ],
+      "region": "us-east-1",
+      "DeniedActions": [
+        {"service": "iam", "reason": "no IAM permissions granted"},
+        {"service": "s3", "reason": "no s3:* permission attached"}
+      ]
+    },
+    {
+      "UserName": "charlie",
+      "Arn": "arn:aws:iam::123456789012:user/charlie",
+      "Groups": [],
+      "AttachedPolicies": [],
+      "IsRisky": false,
+      "region": "us-east-1",
+      "AssumableRoles": ["AdminAccessRole"],
+      "DeniedActions": [
+        {"service": "ec2", "reason": "no direct permissions"},
+        {"service": "s3", "reason": "no direct permissions"}
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "GroupName": "DevTeam",
+      "Arn": "arn:aws:iam::123456789012:group/DevTeam",
+      "AttachedPolicies": [
+        {"PolicyName": "PowerUserAccess", "PolicyArn": "arn:aws:iam::aws:policy/PowerUserAccess"}
+      ],
+      "IsRisky": true,
+      "RiskScore": 7,
+      "Findings": [
+        {"code": "ACTION_WILDCARD", "severity": "MEDIUM", "action": "*"}
+      ],
+      "region": "us-east-1",
+      "DeniedActions": [
+        {"service": "iam", "reason": "PowerUserAccess prevents IAM modify actions"}
+      ]
+    },
+    {
+      "GroupName": "DevOps",
+      "Arn": "arn:aws:iam::123456789012:group/DevOps",
+      "AttachedPolicies": [
+        {"PolicyName": "CloudWatchFullAccess", "PolicyArn": "arn:aws:iam::aws:policy/CloudWatchFullAccess"}
+      ],
+      "IsRisky": false,
+      "region": "us-east-1",
+      "DeniedActions": [
+        {"service": "iam", "reason": "no IAM privileges"},
+        {"service": "ec2", "reason": "not included in CloudWatchFullAccess"}
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "RoleName": "LambdaExecutionRole",
+      "Arn": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+      "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+      "AttachedPolicies": [
+        {"PolicyName": "AWSLambdaBasicExecutionRole", "PolicyArn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"}
+      ],
+      "AssumePolicyRisk": false,
+      "AssumePolicyRiskScore": 0,
+      "IsRisky": false,
+      "region": "us-east-1"
+    },
+    {
+      "RoleName": "AdminAccessRole",
+      "Arn": "arn:aws:iam::123456789012:role/AdminAccessRole",
+      "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:user/charlie"}, "Action": "sts:AssumeRole"}]},
+      "AttachedPolicies": [
+        {"PolicyName": "AdministratorAccess", "PolicyArn": "arn:aws:iam::aws:policy/AdministratorAccess"}
+      ],
+      "AssumePolicyRisk": true,
+      "AssumePolicyRiskScore": 9,
+      "IsRisky": true,
+      "region": "us-east-1"
+    }
+  ],
+  "policies": [
+    {
+      "PolicyName": "CustomLambdaLoggingPolicy",
+      "Arn": "arn:aws:iam::123456789012:policy/CustomLambdaLoggingPolicy",
+      "Document": {"Statement": [{"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*"}]},
+      "IsRisky": true,
+      "RiskScore": 6,
+      "Findings": [{"code": "RESOURCE_WILDCARD", "severity": "MEDIUM", "action": "logs:*"}],
+      "region": "us-east-1"
+    },
+    {
+      "PolicyName": "CustomRestrictedEC2Policy",
+      "Arn": "arn:aws:iam::123456789012:policy/CustomRestrictedEC2Policy",
+      "Document": {"Statement": [{"Effect": "Allow", "Action": ["ec2:StartInstances", "ec2:StopInstances"], "Resource": "*", "Condition": {"StringEquals": {"ec2:Region": "us-east-1"}}}]},
+      "IsRisky": false,
+      "RiskScore": 0,
+      "Findings": [],
+      "region": "us-east-1"
+    }
+  ]
+}
